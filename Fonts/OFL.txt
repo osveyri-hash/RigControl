@@ -1,0 +1,7 @@
+Rounded Mplus 1c (M PLUS Rounded 1c)
+Copyright 2016 The Rounded M+ Project Authors.
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+Full text: https://openfontlicense.org/open-font-license-official-text/
+
+В программу встроена урезанная копия шрифта (латиница, кириллица, символы и кана для каомодзи).

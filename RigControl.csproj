@@ -1,0 +1,54 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>RigControl</AssemblyName>
+    <RootNamespace>RigControl</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <Version>2.17.3</Version>
+    <!-- Поменьше памяти: рабочая станция (не серверный GC), плотная куча (ConserveMemory ниже), без профилировки JIT.
+         Фоновый GC оставлен включённым: без него у .NET 8 стартовый бюджет молодого поколения в разы больше,
+         и программа держала лишние десятки МБ. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <!-- Динамический PGO ускоряет длительно работающие циклы HID/ARGB без
+         увеличения размера framework-dependent сборки. -->
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.GC.ConserveMemory" Value="7" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Встроенный kawaii-шрифт (SIL OFL, см. Fonts\OFL.txt) -->
+    <Resource Include="Fonts\*.ttf" />
+    <!-- Рисунок кейкапов пользователя (перерисован с фото в ч/б графику), выровненный по схеме 644×276 (×3) -->
+    <Resource Include="Assets\KeyArt.png" />
+    <!-- Логотип: пиксель-арт с картинки пользователя (тот же, что в app.ico) -->
+    <Resource Include="Assets\Logo.png" />
+    <Resource Include="Assets\Devices\*.png" />
+    <!-- Фоны тем экрана помпы: «ASCII», «ASCII ночь», «Манга», «Точки» (Cooler\LcdThemes.cs) -->
+    <Resource Include="Assets\AsciiArt.jpg" />
+    <Resource Include="Assets\AsciiArtDark.jpg" />
+    <Resource Include="Assets\ArtMangaDark.jpg" />
+    <Resource Include="Assets\ArtDotsDark.jpg" />
+
+    <!-- Милые аниме-темы: гифки и картинка с Pinterest (для личного экрана) -->
+    <Resource Include="Assets\Anime*.gif" />
+    <Resource Include="Assets\AnimeWarm.jpg" />
+    <None Include="Fonts\OFL.txt" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Температуры CPU/GPU и вентиляторы платы (нужны права администратора). Версия закреплена:
+         новую ставить вручную и проверять управление вентиляторами. С 0.9.6 собран прошлый RigControl.exe. -->
+    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
+  </ItemGroup>
+
+</Project>

@@ -1,12 +1,5 @@
-# Сборка
 bin/
 obj/
-dist/
-dist-installer/
-dist-lite/
+.vs/
 *.user
 *.suo
-.vs/
-
-# Локальные настройки устройства
-device.env

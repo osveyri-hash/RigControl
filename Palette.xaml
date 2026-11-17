@@ -1,0 +1,60 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <!-- Rig Control: чёрная тема. Чистый чёрный фон, серые поверхности, белый акцент. -->
+    <SolidColorBrush x:Key="SurfaceBrush" Color="#0A0A0A" />
+    <SolidColorBrush x:Key="CardBrush" Color="#0E0E0E" />
+    <SolidColorBrush x:Key="Surface2Brush" Color="#181818" />
+    <SolidColorBrush x:Key="HoverBrush" Color="#222222" />
+    <SolidColorBrush x:Key="PressedBrush" Color="#2E2E2E" />
+    <SolidColorBrush x:Key="LineBrush" Color="#262626" />
+    <SolidColorBrush x:Key="TextBrush" Color="#F2F2F2" />
+    <SolidColorBrush x:Key="MutedBrush" Color="#9A9A9A" />
+    <SolidColorBrush x:Key="AccentBrush" Color="#F2F2F2" />
+    <SolidColorBrush x:Key="AccentHoverBrush" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="AccentDimBrush" Color="#1E1E1E" />
+    <SolidColorBrush x:Key="AccentDeepBrush" Color="#BDBDBD" />
+    <SolidColorBrush x:Key="AccentTextBrush" Color="#000000" />
+    <SolidColorBrush x:Key="ToggleThumbBrush" Color="#E6E6E6" />
+    <SolidColorBrush x:Key="MintBrush" Color="#8AD7BA" />
+    <SolidColorBrush x:Key="GoodBrush" Color="#7CD6A6" />
+    <SolidColorBrush x:Key="BadBrush" Color="#FF8A96" />
+    <SolidColorBrush x:Key="PreviewBrush" Color="#000000" />
+    <SolidColorBrush x:Key="CaptionHoverBrush" Color="#1AFFFFFF" />
+    <SolidColorBrush x:Key="CloseHoverBrush" Color="#C42B1C" />
+    <SolidColorBrush x:Key="WindowGradient" Color="#000000" />
+    <SolidColorBrush x:Key="SidebarGradient" Color="#050505" />
+    <SolidColorBrush x:Key="AccentGradient" Color="#F2F2F2" />
+    <SolidColorBrush x:Key="AccentGradientHover" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="NavSelectedGradient" Color="#1A1A1A" />
+    <!-- Единый стеклянный слой для выбранных пунктов и вкладок. -->
+    <LinearGradientBrush x:Key="LiquidGlassBrush" StartPoint="0,0" EndPoint="1,1">
+        <GradientStop Color="#52FFFFFF" Offset="0" />
+        <GradientStop Color="#20FFFFFF" Offset="0.34" />
+        <GradientStop Color="#0EFFFFFF" Offset="0.7" />
+        <GradientStop Color="#38FFFFFF" Offset="1" />
+    </LinearGradientBrush>
+    <SolidColorBrush x:Key="LiquidGlassBorderBrush" Color="#A0FFFFFF" />
+    <SolidColorBrush x:Key="LiquidGlassHoverBrush" Color="#2AFFFFFF" />
+    <DropShadowEffect x:Key="LiquidGlassShadow" Color="#FFFFFF" BlurRadius="22"
+                      ShadowDepth="0" Opacity="0.24" />
+    <LinearGradientBrush x:Key="KeyDeckBrush" StartPoint="0,0" EndPoint="0,1">
+        <GradientStop Color="#222222" Offset="0" />
+        <GradientStop Color="#141414" Offset="1" />
+    </LinearGradientBrush>
+    <!-- Схема мыши на вкладке «Кнопки» -->
+    <LinearGradientBrush x:Key="MouseBodyBrush" StartPoint="0.2,0" EndPoint="0.8,1">
+        <GradientStop Color="#2E2E2E" Offset="0" />
+        <GradientStop Color="#1F1F1F" Offset="0.55" />
+        <GradientStop Color="#141414" Offset="1" />
+    </LinearGradientBrush>
+    <SolidColorBrush x:Key="MouseEdgeBrush" Color="#3C3C3C" />
+    <SolidColorBrush x:Key="MouseWheelBrush" Color="#050505" />
+    <SolidColorBrush x:Key="MouseSideBrush" Color="#1C1C1C" />
+    <SolidColorBrush x:Key="MouseZoneHoverBrush" Color="#1FFFFFFF" />
+    <SolidColorBrush x:Key="MouseZoneSelBrush" Color="#38FFFFFF" />
+    <RadialGradientBrush x:Key="MouseGlowBrush">
+        <GradientStop Color="#26FFFFFF" Offset="0" />
+        <GradientStop Color="#00FFFFFF" Offset="1" />
+    </RadialGradientBrush>
+    <DropShadowEffect x:Key="SoftShadow" Color="#000000" BlurRadius="18" ShadowDepth="3" Direction="270" Opacity="0.6" />
+</ResourceDictionary>
