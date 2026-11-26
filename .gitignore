@@ -1,5 +1,11 @@
-bin/
-obj/
+# Rust
+/target/
+# .NET (помощник датчиков sensors/). Не «bin/» целиком: в src/bin лежат исходники программ.
+/sensors/bin/
+/sensors/obj/
 .vs/
 *.user
 *.suo
+# Журнал сборки build.bat и резервные копии
+build-log.txt
+*.bak

@@ -1,0 +1,42 @@
+[package]
+name = "rigcontrol-core"
+version = "0.38.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Порт RigControl (C#) на Rust: протокол AJAZZ AK820 Pro, эффекты подсветки и консольная утилита"
+license = "MIT"
+
+[lib]
+name = "rigcontrol_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rigcontrol"
+path = "src/bin/rigcontrol.rs"
+
+# Окно с треем: cargo build --release --features gui
+[[bin]]
+name = "rigcontrol-gui"
+path = "src/bin/rigcontrol-gui.rs"
+required-features = ["gui"]
+
+# Фоновая служба со значком в трее: работает, пока окно закрыто.
+[[bin]]
+name = "rigcontrol-service"
+path = "src/bin/rigcontrol-service.rs"
+required-features = ["gui"]
+
+[features]
+gui = ["dep:eframe", "dep:tray-icon", "dep:rfd"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hidapi = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ab_glyph = "0.2"
+sysinfo = "0.32"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+eframe = { version = "0.29", optional = true }
+tray-icon = { version = "0.19", optional = true }
+rfd = { version = "0.15", optional = true }
