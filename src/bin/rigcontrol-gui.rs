@@ -474,22 +474,30 @@ impl App {
             self.svc_again = Some(self.svc_again.unwrap_or(false) || keyboard);
             return;
         }
-        let old = self.svc.take();
-        if let Some(o) = &old {
+        if let Some(o) = &self.svc {
             self.svc_last = o.status();
         }
+        // Старая служба — в общей ячейке: если поток не создастся, её можно забрать обратно и остановить здесь.
+        let old = std::sync::Arc::new(std::sync::Mutex::new(self.svc.take()));
+        let cell = old.clone();
         // Кнопка «Остановить» на странице помпы: служба без вывода на экран.
         let (s, pump) = (self.s.clone(), !self.pump_off);
         let job = std::thread::Builder::new().name("svc-restart".into()).spawn(move || {
-            if let Some(o) = old {
+            if let Some(o) = cell.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 o.stop();
             }
             Service::start_with(&s, keyboard, pump)
         });
         match job {
             Ok(j) => self.svc_job = Some(j),
-            // Поток не создался (старая служба при этом уже получила «стоп»): запускаем здесь.
-            Err(_) => self.svc = Some(Service::start_with(&self.s, keyboard, !self.pump_off)),
+            // Поток не создался: останавливаем старую службу здесь и дожидаемся её потоков (stop, а не drop:
+            // drop только ставит флаг, и новая служба стартовала бы рядом с ещё работающей старой).
+            Err(_) => {
+                if let Some(o) = old.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    o.stop();
+                }
+                self.svc = Some(Service::start_with(&self.s, keyboard, !self.pump_off));
+            }
         }
     }
 
@@ -3056,13 +3064,25 @@ fn main() -> Result<(), eframe::Error> {
         Instance::AlreadyRunning => return Ok(()),
     };
     // Фоновая служба отдаёт устройства окну (ждём, пока отдаст, — иначе они достанутся обоим сразу).
-    let (service, service_note) = match service_link::pause() {
-        Ok(p) => (p, None),
+    let service = match service_link::pause() {
+        Ok(p) => p,
         // Служба есть, но устройства не отдала: просим её выйти совсем (ответ «OK» — когда всё остановлено).
         // При закрытии окна с «работой в фоне» она запустится снова.
+        Err(_) if service_link::quit() => None,
+        // Ни пауза, ни выход не подтверждены: устройства, возможно, ещё у службы. Свои потоки рядом с её
+        // потоками не запускаем (клавиатура, помпа и вентиляторы получали бы команды от двух программ) —
+        // говорим, что делать, и выходим.
         Err(e) => {
-            let stopped = service_link::quit();
-            (None, (!stopped).then(|| format!("Фоновая служба не отдала устройства ({e}). Закройте её: значок в трее → «Выход», затем откройте окно снова.")))
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title(WINDOW_TITLE)
+                .set_description(format!(
+                    "Фоновая служба RigControl не отдала устройства ({e}).\n\n\
+                     Закройте её: значок RigControl в трее → «Выход» (если не закрывается — снимите \
+                     rigcontrol-service.exe в диспетчере задач) и откройте окно снова."
+                ))
+                .show();
+            return Ok(());
         }
     };
     let mut viewport = egui::ViewportBuilder::default()
@@ -3083,11 +3103,7 @@ fn main() -> Result<(), eframe::Error> {
             theme::apply(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             single_instance::listen(lock, move || restore(&ctx));
-            let mut app = App::new(service);
-            if let Some(note) = service_note {
-                app.msg = note;
-            }
-            Ok(Box::new(app))
+            Ok(Box::new(App::new(service)))
         }),
     )
 }

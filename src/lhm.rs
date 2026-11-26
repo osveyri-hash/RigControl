@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -30,8 +31,15 @@ const RETRY: Duration = Duration::from_secs(30);
 /// Без предела зависший помощник навсегда держал бы общий замок: вентиляторы замирали на последней
 /// скорости, а [`shutdown`] не мог его закрыть.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
-/// zen (ожидание PCI до 5 с) и specs (WMI) отвечают дольше.
+/// zen (ожидание PCI до 5 с) и specs (WMI) отвечают дольше. Их читает отдельный разовый помощник
+/// (см. [`one_shot`]), так что вентиляторы эти секунды не ждут.
 const SLOW_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Помощник не ответил вовремя: столько ещё ждём, что он дочитает запрос, получит «quit», вернёт
+/// вентиляторы плате и выйдет сам. Снимать его сразу нельзя: исходный режим вентиляторов (как было в BIOS)
+/// LibreHardwareMonitor помнит только в памяти процесса — снятый помощник унёс бы его с собой.
+const RETIRE_GRACE: Duration = Duration::from_secs(60);
+/// Не ответивший помощник ещё завершается: нового пока не запускаем (два помощника спорили бы за чип).
+static RETIRING: AtomicBool = AtomicBool::new(false);
 
 /// Канал вентилятора платы (FanInfo в C#). `id` — идентификатор управления в LibreHardwareMonitor.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -97,6 +105,8 @@ struct Helper {
     stdin: ChildStdin,
     /// Строки ответов: stdout читает отдельный поток, чтобы ждать ответ не дольше заданного.
     replies: Receiver<std::io::Result<String>>,
+    /// Последний вызов кончился тайм-аутом: помощник, возможно, жив и просто занят.
+    timed_out: bool,
 }
 
 fn helper_path() -> Option<PathBuf> {
@@ -150,7 +160,7 @@ impl Helper {
             let _ = child.kill();
             return Err(format!("помощник датчиков: {e}"));
         }
-        Ok(Self { child, stdin, replies })
+        Ok(Self { child, stdin, replies, timed_out: false })
     }
 
     fn call(&mut self, request: &str, timeout: Duration) -> Result<String, String> {
@@ -164,24 +174,41 @@ impl Helper {
             Ok(Ok(line)) if !line.is_empty() => Ok(line),
             Ok(Ok(_)) | Err(RecvTimeoutError::Disconnected) => Err("помощник датчиков закрылся".to_string()),
             Ok(Err(e)) => Err(format!("помощник датчиков: {e}")),
-            // Вызывающий код закроет помощника (см. `call` ниже): ответ мог бы прийти позже и сбить протокол.
-            Err(RecvTimeoutError::Timeout) => Err(format!("помощник датчиков не ответил за {} с", timeout.as_secs())),
+            // Вызывающий код отправит помощника на покой (см. `call` ниже): ответ мог бы прийти позже и сбить протокол.
+            Err(RecvTimeoutError::Timeout) => {
+                self.timed_out = true;
+                Err(format!("помощник датчиков не ответил за {} с", timeout.as_secs()))
+            }
         }
+    }
+
+    /// Вежливо закрыть: «quit» (помощник вернёт вентиляторы плате и выйдет), ждать до grace, потом снять.
+    /// true — вышел сам.
+    fn close(&mut self, grace: Duration) -> bool {
+        let _ = self.stdin.write_all(b"{\"cmd\":\"quit\"}\n");
+        let _ = self.stdin.flush();
+        let until = Instant::now() + grace;
+        loop {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            if Instant::now() >= until {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        false
     }
 }
 
 impl Drop for Helper {
     fn drop(&mut self) {
         // Вежливо: помощник вернёт вентиляторы плате и выйдет. Не вышел за 2 с — снимаем.
-        let _ = self.stdin.write_all(b"{\"cmd\":\"quit\"}\n");
-        let _ = self.stdin.flush();
-        for _ in 0..20 {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            self.close(Duration::from_secs(2));
         }
-        let _ = self.child.kill();
     }
 }
 
@@ -200,6 +227,9 @@ fn lock() -> MutexGuard<'static, Shared> {
 
 fn call(s: &mut Shared, request: &str, timeout: Duration) -> Result<String, String> {
     if s.helper.is_none() {
+        if RETIRING.load(Ordering::SeqCst) {
+            return Err("помощник датчиков не ответил вовремя и завершается — новый запустится после него".to_string());
+        }
         if s.retry_at.is_some_and(|t| Instant::now() < t) {
             return Err(s.error.clone().unwrap_or_else(|| "помощник датчиков недоступен".to_string()));
         }
@@ -217,12 +247,38 @@ fn call(s: &mut Shared, request: &str, timeout: Duration) -> Result<String, Stri
         None => Err("помощник датчиков недоступен".to_string()),
     };
     if let Err(e) = &result {
-        s.helper = None;
+        match s.helper.take() {
+            // Не ответил вовремя — даём дочитать и вернуть вентиляторы плате (в фоне: замок не держим).
+            Some(h) if h.timed_out => retire(h),
+            // Закрылся или сломался канал — обычное закрытие.
+            other => drop(other),
+        }
         s.last = None;
         s.retry_at = Some(Instant::now() + RETRY);
         s.error = Some(e.clone());
     }
     result
+}
+
+/// Отправить не ответившего помощника на покой в фоновом потоке (см. [`RETIRE_GRACE`]).
+fn retire(mut helper: Helper) {
+    RETIRING.store(true, Ordering::SeqCst);
+    let spawned = std::thread::Builder::new().name("sensors-retire".into()).spawn(move || {
+        helper.close(RETIRE_GRACE);
+        RETIRING.store(false, Ordering::SeqCst);
+    });
+    if spawned.is_err() {
+        // Поток не создался: помощник уже закрыт обычным образом (Drop замыкания).
+        RETIRING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Разовый помощник для долгих справочных запросов (zen, specs): отдельный процесс, который не открывает
+/// LibreHardwareMonitor и не трогает вентиляторы. Основной помощник и общий замок при этом свободны —
+/// вентиляторы продолжают регулироваться, пока читаются тайминги и WMI (в C# это тоже отдельная задача).
+fn one_shot(request: &str) -> Result<String, String> {
+    let mut helper = Helper::spawn()?;
+    helper.call(request, SLOW_REPLY_TIMEOUT)
 }
 
 /// Закрыть помощника (он сам вернёт вентиляторы плате) и пару секунд не запускать его снова —
@@ -371,16 +427,12 @@ fn payload<T: serde::de::DeserializeOwned>(line: &str, key: &str) -> Result<T, S
 
 /// Curve Optimizer и тайминги ОЗУ (только чтение, через PawnIO). Меняются только из BIOS — читать редко.
 pub fn zen() -> Result<ZenReport, String> {
-    let mut s = lock();
-    let line = call(&mut s, r#"{"cmd":"zen"}"#, SLOW_REPLY_TIMEOUT)?;
-    payload(&line, "zen")
+    payload(&one_shot(r#"{"cmd":"zen"}"#)?, "zen")
 }
 
 /// Характеристики ПК из реестра и WMI и паспорт известной модели (это сотни миллисекунд — читать один раз).
 pub fn specs() -> Result<SystemSpecs, String> {
-    let mut s = lock();
-    let line = call(&mut s, r#"{"cmd":"specs"}"#, SLOW_REPLY_TIMEOUT)?;
-    payload(&line, "specs")
+    payload(&one_shot(r#"{"cmd":"specs"}"#)?, "specs")
 }
 
 /// Скорость вентиляторов: id → % (20–100) или None — вернуть канал плате.
@@ -458,6 +510,28 @@ mod tests {
         let started = Instant::now();
         let e = h.call(r#"{"cmd":"read"}"#, Duration::from_millis(300)).unwrap_err();
         assert!(e.contains("не ответил"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_helper_is_allowed_to_finish_and_quit_by_itself() {
+        // Занят 1 с, потом читает следующую строку («quit») и выходит сам — как настоящий помощник,
+        // который после долгого чтения возвращает вентиляторы плате. Снимать его сразу нельзя.
+        let mut h = fake_helper("read first; sleep 1; read second; [ \"$second\" = '{\"cmd\":\"quit\"}' ] && exit 0; exit 3");
+        let e = h.call(r#"{"cmd":"read"}"#, Duration::from_millis(200)).unwrap_err();
+        assert!(h.timed_out && e.contains("не ответил"), "{e}");
+        assert!(h.close(Duration::from_secs(10)), "помощник должен выйти сам, а не быть снятым");
+        assert_eq!(h.child.wait().unwrap().code(), Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_helper_is_killed_after_the_grace_period() {
+        let mut h = fake_helper("read first; sleep 30");
+        assert!(h.call(r#"{"cmd":"read"}"#, Duration::from_millis(100)).is_err());
+        let started = Instant::now();
+        assert!(!h.close(Duration::from_millis(300)));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 

@@ -38,30 +38,53 @@ pub fn sibling(name: &str) -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-fn connect() -> Option<TcpStream> {
-    let s = TcpStream::connect_timeout(&([127, 0, 0, 1], PORT).into(), Duration::from_millis(400)).ok()?;
-    let _ = s.set_nodelay(true);
-    Some(s)
+/// Чем кончился вопрос к службе.
+enum Answer {
+    /// Порт никто не слушает: службы нет.
+    Absent,
+    /// Ответ (и соединение — для паузы).
+    Reply(TcpStream, String),
+    /// Служба есть (соединение принято), но ответа не было: тайм-аут, обрыв, ошибка обмена.
+    /// Это НЕ «службы нет»: устройства могут быть ещё у неё.
+    Silent(String),
 }
 
-/// Отправить команду и дождаться ответа. Возвращает соединение (для паузы) и ответ.
-fn ask(cmd: &str, timeout: Duration) -> Option<(TcpStream, String)> {
-    let mut s = connect()?;
-    s.set_read_timeout(Some(timeout)).ok()?;
-    writeln!(s, "{MAGIC} {cmd}").ok()?;
-    let mut line = String::new();
-    BufReader::new(s.try_clone().ok()?).read_line(&mut line).ok()?;
-    Some((s, line.trim().to_string()))
+/// Отправить команду и дождаться ответа.
+fn ask(cmd: &str, timeout: Duration) -> Answer {
+    ask_at(PORT, cmd, timeout)
+}
+
+fn ask_at(port: u16, cmd: &str, timeout: Duration) -> Answer {
+    let Ok(mut s) = TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(400)) else {
+        return Answer::Absent;
+    };
+    let _ = s.set_nodelay(true);
+    let exchange = |s: &mut TcpStream| -> std::io::Result<String> {
+        s.set_read_timeout(Some(timeout))?;
+        writeln!(s, "{MAGIC} {cmd}")?;
+        let mut line = String::new();
+        BufReader::new(s.try_clone()?).read_line(&mut line)?;
+        Ok(line)
+    };
+    match exchange(&mut s) {
+        Ok(line) if !line.trim().is_empty() => Answer::Reply(s, line.trim().to_string()),
+        Ok(_) => Answer::Silent("служба закрыла соединение без ответа".into()),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+            Answer::Silent(format!("служба не ответила за {} с", timeout.as_secs()))
+        }
+        Err(e) => Answer::Silent(format!("связь со службой: {e}")),
+    }
 }
 
 /// Служба запущена.
 pub fn running() -> bool {
-    matches!(ask("PING", Duration::from_secs(1)), Some((_, r)) if r == "OK")
+    matches!(ask("PING", Duration::from_secs(1)), Answer::Reply(_, r) if r == "OK")
 }
 
-/// Попросить службу выйти (ответ — когда она всё остановила). false — службы нет.
+/// Попросить службу выйти. true — служба ответила «OK»: всё остановила и выходит.
+/// false — службы нет или она не подтвердила остановку.
 pub fn quit() -> bool {
-    matches!(ask("QUIT", Duration::from_secs(12)), Some((_, r)) if r == "OK")
+    matches!(ask("QUIT", Duration::from_secs(12)), Answer::Reply(_, r) if r == "OK")
 }
 
 /// Служба на паузе, пока жив этот объект (точнее, его соединение).
@@ -83,15 +106,19 @@ impl Pause {
 /// Поставить запущенную службу на паузу: ждём, пока она отдаст устройства (до 15 с).
 /// Ok(None) — службы нет; Err — служба есть, но устройства не отдала (запускать свои потоки нельзя).
 pub fn pause() -> Result<Option<Pause>, String> {
-    let Some((s, r)) = ask("PAUSE", Duration::from_secs(15)) else { return Ok(None) };
-    match r.as_str() {
-        "PAUSED" => {
+    pause_at(PORT, Duration::from_secs(15))
+}
+
+fn pause_at(port: u16, timeout: Duration) -> Result<Option<Pause>, String> {
+    match ask_at(port, "PAUSE", timeout) {
+        Answer::Absent => Ok(None),
+        Answer::Reply(s, r) if r == "PAUSED" => {
             let _ = s.set_read_timeout(None);
             Ok(Some(Pause { stream: s }))
         }
-        "" => Err("служба не ответила за 15 с".into()),
-        "BUSY" => Err("служба не успела остановить устройства".into()),
-        other => Err(format!("неожиданный ответ «{other}»")),
+        Answer::Reply(_, r) if r == "BUSY" => Err("служба не успела остановить устройства".into()),
+        Answer::Reply(_, r) => Err(format!("неожиданный ответ «{r}»")),
+        Answer::Silent(why) => Err(why),
     }
 }
 
@@ -259,6 +286,64 @@ mod tests {
         assert_eq!(reply(&s), "BUSY");
         assert_eq!(seen.recv_timeout(Duration::from_secs(5)).unwrap(), "pause");
         assert_eq!(seen.recv_timeout(Duration::from_secs(5)).unwrap(), "resume");
+    }
+
+    #[test]
+    fn client_tells_absent_service_from_silent_one() {
+        // Порт никто не слушает — службы нет, окну можно вести устройства самому.
+        let free = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert!(matches!(pause_at(free, Duration::from_millis(200)), Ok(None)));
+
+        // Служба есть, но молчит (зависла на остановке устройств) — это ошибка, а не «службы нет».
+        let silent = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let e = pause_at(port, Duration::from_millis(200)).err().expect("молчащая служба — ошибка");
+        assert!(e.contains("не ответила"), "{e}");
+
+        // Служба приняла соединение и закрыла его без ответа — тоже ошибка.
+        let closing = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = closing.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for s in closing.incoming().flatten() {
+                drop(s);
+            }
+        });
+        assert!(pause_at(port, Duration::from_secs(2)).is_err());
+    }
+
+    #[test]
+    fn client_gets_pause_and_busy_from_real_handler() {
+        // Полный путь: клиент pause_at ↔ серверный handle_with.
+        let serve = |wait: Duration, ack: bool| {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (tx, rx) = mpsc::channel::<Request>();
+            std::thread::spawn(move || {
+                let mut held = Vec::new();
+                for r in rx {
+                    match r {
+                        Request::Pause(a) if ack => {
+                            let _ = a.send(());
+                        }
+                        other => held.push(other),
+                    }
+                }
+            });
+            std::thread::spawn(move || {
+                for s in listener.incoming().flatten() {
+                    let tx = tx.clone();
+                    std::thread::spawn(move || handle_with(s, tx, wait, wait));
+                }
+            });
+            port
+        };
+        let ok = pause_at(serve(Duration::from_secs(5), true), Duration::from_secs(5));
+        assert!(matches!(ok, Ok(Some(_))));
+        let busy = pause_at(serve(Duration::from_millis(200), false), Duration::from_secs(5));
+        assert!(busy.err().is_some_and(|e| e.contains("не успела")));
     }
 
     #[test]

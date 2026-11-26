@@ -113,12 +113,16 @@ mod tests {
         let (l, port) = local();
         let shown = Arc::new(AtomicUsize::new(0));
         let n = shown.clone();
+        // Ответ уходит раньше вызова on_show — ждём сам вызов, а не гадаем по счётчику.
+        let (called_tx, called) = std::sync::mpsc::channel();
         listen(l, move || {
             n.fetch_add(1, Ordering::SeqCst);
+            let _ = called_tx.send(());
         });
         assert_eq!(probe(port, PING, Duration::from_secs(2)), Probe::Ours);
-        assert_eq!(shown.load(Ordering::SeqCst), 0);
         assert_eq!(probe(port, HELLO, Duration::from_secs(2)), Probe::Ours);
+        called.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Запросы разбираются по очереди: PING уже обработан, и окно он не показывал.
         assert_eq!(shown.load(Ordering::SeqCst), 1);
     }
 

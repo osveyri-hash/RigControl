@@ -38,6 +38,10 @@ pub struct Settings {
     pub cooler_size: i32,
     /// Раскладка сцены хранится как есть (JSON из C#), чтобы файл оставался общим для обеих версий.
     pub cooler_layout: Option<Value>,
+    /// Размер сцены, в координатах которого редактор Rust-версии записал CoolerLayout ([ширина, высота]).
+    /// None — раскладку записала C#-версия: она хранит её прямо в координатах экрана помпы.
+    /// (C#-версия это поле не знает и при своей записи его убирает — раскладка тогда снова «её».)
+    pub cooler_layout_base: Option<[u32; 2]>,
     pub cooler_background: Option<String>,
     pub cooler_bg_top: Option<String>,
     pub cooler_bg_bottom: Option<String>,
@@ -106,6 +110,7 @@ impl Default for Settings {
             cooler_rotation: 0,
             cooler_size: 0,
             cooler_layout: None,
+            cooler_layout_base: None,
             cooler_background: None,
             cooler_bg_top: None,
             cooler_bg_bottom: None,

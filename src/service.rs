@@ -277,9 +277,11 @@ const REARM_KEEP_ALIVE: Duration = Duration::from_secs(30);
 const REARM_BACKOFF: Duration = Duration::from_secs(300);
 
 impl ReArm {
-    fn new() -> Self {
-        // Помпу только что открыли — рукопожатие уже было.
-        Self { last_frame: None, last_rearm: Instant::now(), blocked_until: None }
+    /// opened — когда помпу открыли (тогда же было рукопожатие). Отсчёт паузы — от него: загрузка гифки
+    /// или первый опрос датчиков между открытием и первым кадром тоже могут увести помпу на логотип
+    /// (в C# перед запуском показа всегда идёт Reinit).
+    fn new(opened: Instant) -> Self {
+        Self { last_frame: Some(opened), last_rearm: opened, blocked_until: None }
     }
 
     /// Пора ли повторить рукопожатие перед кадром, который идёт раз в interval_ms.
@@ -320,6 +322,7 @@ fn pump_diag(st: &Status, lcd: &cooler::CoolerLcd, fps: f64) {
 fn pump_loop(s: &Settings, stop: &AtomicBool, st: &Status) -> Result<(), String> {
     let api = hidapi::HidApi::new().map_err(|e| format!("hidapi: {e}"))?;
     let mut lcd = cooler::CoolerLcd::open(&api, None)?;
+    let opened = Instant::now();
     // Размер экрана выбран вручную — он важнее ответа помпы.
     if let Some(&(w, h)) = PUMP_SIZES.get(s.cooler_size.max(0) as usize).filter(|p| p.0 > 0) {
         lcd.resolution = (w, h);
@@ -349,7 +352,7 @@ fn pump_loop(s: &Settings, stop: &AtomicBool, st: &Status) -> Result<(), String>
             let name = Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string());
             set_status(st, "Помпа", format!("{} · картинка {name} ({} кадр.)", lcd.description(), frames.len()));
             let mut i = 0usize;
-            let mut rearm = ReArm::new();
+            let mut rearm = ReArm::new(opened);
             while !stop.load(Ordering::Relaxed) {
                 let tick = Instant::now();
                 let f = &frames[i % frames.len()];
@@ -373,7 +376,7 @@ fn pump_loop(s: &Settings, stop: &AtomicBool, st: &Status) -> Result<(), String>
         .and_then(lcdscene::find_theme)
         .unwrap_or_else(lcdscene::default_theme);
     // Своя раскладка из редактора (CoolerLayout), иначе — раскладка темы.
-    let custom = lcdscene::saved_layout(s.cooler_layout.as_ref(), w, h);
+    let custom = lcdscene::saved_layout(s.cooler_layout.as_ref(), s.cooler_layout_base, w, h);
     let layout_name = if custom.is_some() { "своя раскладка" } else { "раскладка темы" };
     let items = custom.unwrap_or_else(|| lcdscene::layout_for(&theme, w, h));
     // Фон: своя картинка или картинка темы (pack://…); гифка проигрывается.
@@ -403,7 +406,7 @@ fn pump_loop(s: &Settings, stop: &AtomicBool, st: &Status) -> Result<(), String>
     let mut last_sig = String::new();
     let mut last_frame: Option<image::RgbImage> = None;
     let mut last_sent = Instant::now() - Duration::from_secs(1);
-    let mut rearm = ReArm::new();
+    let mut rearm = ReArm::new(opened);
     while !stop.load(Ordering::Relaxed) {
         let tick = Instant::now();
         // Датчики — раз в секунду (LibreHardwareMonitor тяжёлый, чаще смысла нет); частота кадров на это не влияет.
@@ -502,8 +505,10 @@ mod tests {
         assert!(r.due(500, t0 + Duration::from_secs(31)));
         r.blocked_until = Some(t0 + Duration::from_secs(300));
         assert!(!r.due(500, t0 + Duration::from_secs(31)));
-        // Первый кадр после открытия: рукопожатие только что было.
-        assert!(!ReArm::new().due(500, Instant::now()));
+        // Первый кадр сразу после открытия: рукопожатие только что было.
+        assert!(!ReArm::new(t0).due(500, t0 + Duration::from_millis(600)));
+        // Между открытием и первым кадром долго читали гифку или датчики — рукопожатие повторяем.
+        assert!(ReArm::new(t0).due(500, t0 + Duration::from_secs(3)));
     }
 
     #[test]

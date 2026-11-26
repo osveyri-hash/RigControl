@@ -20,7 +20,7 @@ pub const ARGB_KEYS: &[&str] =
 pub const FAN_KEYS: &[&str] = &["FanModes", "FanPercent", "FanCurves", "FanModeAll"];
 /// Поля экрана помпы (ApplyPumpPart).
 pub const PUMP_KEYS: &[&str] = &[
-    "CoolerLayout", "CoolerBackground", "CoolerBgTop", "CoolerBgBottom", "CoolerBrightness", "CoolerFps", "CoolerTheme",
+    "CoolerLayout", "CoolerLayoutBase", "CoolerBackground", "CoolerBgTop", "CoolerBgBottom", "CoolerBrightness", "CoolerFps", "CoolerTheme",
 ];
 
 /// Части профиля: флажок Use*, его поля и подпись для сообщения.
@@ -177,6 +177,11 @@ pub fn apply(p: &Value, s: &mut Settings) -> Result<Vec<&'static str>, String> {
                 continue;
             }
             obj.insert((*k).to_string(), v.clone());
+        }
+        // Раскладка экрана помпы и отметка её координат ходят вместе: профиль из C#-версии отметки
+        // не имеет — значит, его раскладка в координатах экрана, и старую отметку надо снять.
+        if use_key == "UsePump" && p.get("CoolerLayout").is_some_and(|v| !v.is_null()) {
+            obj.insert("CoolerLayoutBase".to_string(), p.get("CoolerLayoutBase").cloned().unwrap_or(Value::Null));
         }
         parts.push(label);
     }

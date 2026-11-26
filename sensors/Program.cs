@@ -289,7 +289,7 @@ internal sealed class Sensors : IDisposable
                     {
                         // Забываем канал только после удачного возврата: иначе следующий запрос «вернуть плате»
                         // ничего бы не сделал, и RestoreFans при выходе его бы пропустил.
-                        control.SetDefault();
+                        ReturnToBoard(control, _applied[id]);
                         _applied.Remove(id);
                     }
                 }
@@ -306,6 +306,18 @@ internal sealed class Sensors : IDisposable
             throw new IOException("не удалось вернуть вентилятор плате (" + string.Join("; ", notRestored) + ")");
     }
 
+    /// <summary>
+    /// Вернуть канал плате так, чтобы команда действительно ушла в чип. LibreHardwareMonitor сначала меняет
+    /// режим на Default и только потом пишет в железо: если запись не удалась, режим уже Default, и повторный
+    /// SetDefault ничего бы не сделал (а канал считался бы возвращённым). Поэтому после неудачи сперва снова
+    /// выставляем прежнюю ручную скорость — режим становится Software, — и уже потом возвращаем плате.
+    /// </summary>
+    private static void ReturnToBoard(IControl control, float lastValue)
+    {
+        if (control.ControlMode == ControlMode.Default) control.SetSoftware(lastValue);
+        control.SetDefault();
+    }
+
     /// <summary>Все каналы, которыми управляли, — обратно плате.</summary>
     public void RestoreFans()
     {
@@ -316,7 +328,8 @@ internal sealed class Sensors : IDisposable
             {
                 try
                 {
-                    if (_controls.TryGetValue(id, out var sensor)) sensor.Control?.SetDefault();
+                    if (_controls.TryGetValue(id, out var sensor) && sensor.Control is { } control)
+                        ReturnToBoard(control, _applied[id]);
                     _applied.Remove(id);
                 }
                 catch

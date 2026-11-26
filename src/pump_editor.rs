@@ -55,7 +55,9 @@ fn hex(c: (u8, u8, u8)) -> String {
 impl PumpEditor {
     pub fn new(s: &Settings) -> Self {
         let base = lcdscene::layout_base(s.cooler_rotation);
-        let items = lcdscene::saved_layout(s.cooler_layout.as_ref(), base.0, base.1)
+        // Раскладка без отметки размера (из C#-версии) берётся как есть: редактор считает её записанной
+        // для своей сцены — на экране 320×240 это одно и то же.
+        let items = lcdscene::saved_layout(s.cooler_layout.as_ref(), s.cooler_layout_base, base.0, base.1)
             .unwrap_or_else(|| lcdscene::layout_for(&theme_of(s), base.0, base.1));
         Self {
             items, sel: None, drag_off: None, fonts: Fonts::default(), tex: None, sig: String::new(),
@@ -71,6 +73,7 @@ impl PumpEditor {
         self.sel = None;
         self.group.clear();
         s.cooler_layout = None;
+        s.cooler_layout_base = None;
     }
 
     /// ApplyTheme из C#: тема меняет раскладку и фон целиком (цвета, картинку, яркость).
@@ -411,6 +414,8 @@ impl PumpEditor {
         }
         if changed {
             s.cooler_layout = Some(lcdscene::items_to_json(&self.items));
+            // Отметка «в каких координатах записано»: служба подгонит раскладку под настоящий экран помпы.
+            s.cooler_layout_base = Some([self.base.0, self.base.1]);
         }
         changed
     }
