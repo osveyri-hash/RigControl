@@ -530,6 +530,11 @@ impl App {
         }
     }
 
+    /// Размер экрана, с которым служба открыла помпу (None — помпа не открыта).
+    fn pump_detected_size(&self) -> Option<(u32, u32)> {
+        self.svc_status("Помпа·экран").as_deref().and_then(rigcontrol_core::service::parse_panel_size)
+    }
+
     fn svc_status(&self, part: &str) -> Option<String> {
         // Пока идёт перезапуск — последнее известное состояние, чтобы строки не мигали.
         let status = match &self.svc {
@@ -1745,6 +1750,8 @@ impl App {
                     } else {
                         kit::h2(ui, "Редактор экрана");
                         ui.add_space(6.0);
+                        let detected = self.pump_detected_size();
+                        self.editor.set_panel(&self.s, detected);
                         self.editor.show(ui, &mut self.s);
                     }
                 });
@@ -1799,14 +1806,10 @@ impl App {
             ui.label(muted_text("Выберите картинку или гифку — она будет показываться на помпе вместо сцены."));
             return;
         }
-        // Кадр готовим под тот же экран, что и служба: размер, выбранный вручную (иначе 320×240),
-        // при повороте на 90°/270° — вертикальный. Показываем «как видно на помпе», без поворота под панель.
-        let (pw, ph) = rigcontrol_core::service::PUMP_SIZES
-            .get(self.s.cooler_size.max(0) as usize)
-            .copied()
-            .filter(|p| p.0 > 0)
-            .unwrap_or((320, 240));
-        let (pw, ph) = if matches!(self.s.cooler_rotation, 90 | 270) { (ph, pw) } else { (pw, ph) };
+        // Кадр готовим под тот же экран, что и служба: размер, выбранный вручную, иначе ответ помпы,
+        // иначе 320×240; при повороте на 90°/270° — вертикальный. Показываем «как видно на помпе».
+        let panel = rigcontrol_core::service::panel_size(&self.s, self.pump_detected_size());
+        let (pw, ph) = lcdscene::scene_size(panel, self.s.cooler_rotation);
         let key = format!("{path}|{}|{pw}x{ph}", self.s.crop);
         if self.pump_preview.as_ref().map(|p| p.0 != key).unwrap_or(true) {
             let frames = cooler::load_image(std::path::Path::new(&path), pw, ph, 0, self.s.crop).unwrap_or_default();

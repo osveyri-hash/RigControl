@@ -816,21 +816,16 @@ pub fn items_to_json(items: &[LcdItem]) -> serde_json::Value {
     })).collect())
 }
 
-/// Размер сцены, в котором редактор держит раскладку (портрет при повороте 90/270).
-pub fn layout_base(rotation: i32) -> (u32, u32) {
-    if matches!(rotation, 90 | 270) { (LAYOUT_BASE.1, LAYOUT_BASE.0) } else { LAYOUT_BASE }
+/// Размер сцены для экрана panel: при повороте 90°/270° рисуем «боком» (SceneSize в C#).
+pub fn scene_size(panel: (u32, u32), rotation: i32) -> (u32, u32) {
+    if matches!(rotation, 90 | 270) { (panel.1, panel.0) } else { panel }
 }
 
-/// Своя раскладка из настроек для сцены w×h. base — размер сцены, в котором её записал редактор
-/// Rust-версии (CoolerLayoutBase): такую подгоняем под w×h. Без base раскладку записала C#-версия —
-/// прямо в координатах экрана помпы, и её не трогаем (иначе на экране 640×480 объекты уехали бы
-/// и выросли вдвое).
-pub fn saved_layout(v: Option<&serde_json::Value>, base: Option<[u32; 2]>, w: u32, h: u32) -> Option<Vec<LcdItem>> {
-    let items = items_from_json(v?)?;
-    Some(match base {
-        Some([bw, bh]) if bw > 0 && bh > 0 && (bw, bh) != (w, h) => fit(&items, (bw as f64, bh as f64), (w as f64, h as f64)),
-        _ => items,
-    })
+/// Своя раскладка из настроек (CoolerLayout). Она хранится в координатах сцены — то есть экрана помпы,
+/// как её пишет C#-версия (settings.json общий), поэтому берётся как есть, без подгонки под размер:
+/// и редактор, и служба работают в настоящем размере сцены. Под размер подгоняются только темы.
+pub fn saved_layout(v: Option<&serde_json::Value>) -> Option<Vec<LcdItem>> {
+    items_from_json(v?)
 }
 
 fn measure(font: &FontArc, size: f64, text: &str) -> f64 {
@@ -931,14 +926,15 @@ mod layout_tests {
     #[test]
     fn saved_layout_stretches() {
         let v = items_to_json(&LcdItem::default_layout());
-        // Раскладка редактора Rust (записана для сцены 320×240) подгоняется под экран.
-        let big = saved_layout(Some(&v), Some([320, 240]), 480, 480).unwrap();
-        assert_eq!(big[1].x, 188.0 * 1.5);
-        assert!(saved_layout(None, None, 320, 240).is_none());
-        // Раскладка C# (без отметки) уже в координатах экрана — остаётся как есть.
+        // Своя раскладка — в координатах экрана (как пишет C#): берётся как есть при любом размере.
+        let saved = saved_layout(Some(&v)).unwrap();
+        assert_eq!(saved[1].x, 188.0);
+        assert!(saved_layout(None).is_none());
         let csharp: serde_json::Value = serde_json::from_str(r#"[{"Kind":9,"X":376,"Y":40,"Scale":2,"Text":"A"}]"#).unwrap();
-        let same = saved_layout(Some(&csharp), None, 640, 480).unwrap();
+        let same = saved_layout(Some(&csharp)).unwrap();
         assert_eq!((same[0].x, same[0].y, same[0].scale), (376.0, 40.0, 2.0));
+        assert_eq!(scene_size((640, 480), 90), (480, 640));
+        assert_eq!(scene_size((640, 480), 180), (640, 480));
     }
 
     #[test]
@@ -960,7 +956,7 @@ mod layout_tests {
     fn empty_layout_is_an_empty_scene() {
         // Удалили последний объект: это «пусто», а не «вернуть тему».
         let empty = serde_json::json!([]);
-        assert_eq!(saved_layout(Some(&empty), None, 320, 240).map(|v| v.len()), Some(0));
+        assert_eq!(saved_layout(Some(&empty)).map(|v| v.len()), Some(0));
         assert!(items_from_json(&serde_json::json!("мусор")).is_none());
     }
 

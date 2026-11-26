@@ -26,7 +26,10 @@ pub struct PumpEditor {
     /// Фон (своя картинка или картинка темы): путь, размер, кадры с задержками, общая длина гифки.
     bg: Option<(String, (u32, u32), Vec<(RgbImage, u64)>, u64)>,
     started: std::time::Instant,
+    /// Размер сцены: экран помпы с учётом поворота. Раскладка хранится в этих координатах (как в C#).
     base: (u32, u32),
+    /// Экран помпы: выбранный вручную, сообщённый помпой или 320×240.
+    panel: (u32, u32),
     zoom: f32,
     /// Раскладки до изменений (отмена) и отменённые (вернуть).
     undo: Vec<Vec<LcdItem>>,
@@ -54,14 +57,14 @@ fn hex(c: (u8, u8, u8)) -> String {
 
 impl PumpEditor {
     pub fn new(s: &Settings) -> Self {
-        let base = lcdscene::layout_base(s.cooler_rotation);
-        // Раскладка без отметки размера (из C#-версии) берётся как есть: редактор считает её записанной
-        // для своей сцены — на экране 320×240 это одно и то же.
-        let items = lcdscene::saved_layout(s.cooler_layout.as_ref(), s.cooler_layout_base, base.0, base.1)
+        // Пока помпа не ответила, её экран — выбранный вручную или 320×240 (см. set_panel).
+        let panel = crate::service::panel_size(s, None);
+        let base = lcdscene::scene_size(panel, s.cooler_rotation);
+        let items = lcdscene::saved_layout(s.cooler_layout.as_ref())
             .unwrap_or_else(|| lcdscene::layout_for(&theme_of(s), base.0, base.1));
         Self {
             items, sel: None, drag_off: None, fonts: Fonts::default(), tex: None, sig: String::new(),
-            add_kind: LcdKind::Text.index(), bg: None, started: std::time::Instant::now(), base, zoom: 1.5,
+            add_kind: LcdKind::Text.index(), bg: None, started: std::time::Instant::now(), base, panel, zoom: 1.5,
             undo: Vec::new(), redo: Vec::new(), last_change: None, group: Vec::new(), rubber: None, group_drag: None,
             color_draft: None,
         }
@@ -73,7 +76,28 @@ impl PumpEditor {
         self.sel = None;
         self.group.clear();
         s.cooler_layout = None;
-        s.cooler_layout_base = None;
+    }
+
+    /// Размер экрана помпы стал известен или его сменили в настройках (detected — ответ помпы).
+    /// Своя раскладка уже в координатах экрана и не меняется; раскладка темы пересчитывается под новый размер.
+    pub fn set_panel(&mut self, s: &Settings, detected: Option<(u32, u32)>) {
+        let panel = crate::service::panel_size(s, detected);
+        if panel == self.panel {
+            return;
+        }
+        self.panel = panel;
+        self.base = lcdscene::scene_size(panel, s.cooler_rotation);
+        if s.cooler_layout.is_none() {
+            self.items = lcdscene::layout_for(&theme_of(s), self.base.0, self.base.1);
+        }
+        // Номера и история относились к прежней сцене.
+        self.sel = None;
+        self.group.clear();
+        self.group_drag = None;
+        self.drag_off = None;
+        self.undo.clear();
+        self.redo.clear();
+        self.sig.clear();
     }
 
     /// ApplyTheme из C#: тема меняет раскладку и фон целиком (цвета, картинку, яркость).
@@ -136,7 +160,7 @@ impl PumpEditor {
         let mut from_history = false;
 
         // Поворот 90/270 — портретная сцена: растягиваем раскладку под новый размер.
-        let base = lcdscene::layout_base(s.cooler_rotation);
+        let base = lcdscene::scene_size(self.panel, s.cooler_rotation);
         if base != self.base {
             self.items = lcdscene::stretch(&self.items, (self.base.0 as f64, self.base.1 as f64), (base.0 as f64, base.1 as f64));
             self.base = base;
@@ -214,7 +238,8 @@ impl PumpEditor {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(repaint));
 
         // Сцена — на всю ширину карточки (не больше 3×).
-        self.zoom = (ui.available_width() / w as f32).clamp(1.0, 3.0);
+        // Сцена — на всю ширину карточки: маленький экран увеличиваем (до 3×), большой (640×480) — ужимаем.
+        self.zoom = (ui.available_width() / w as f32).clamp(0.25, 3.0);
         let z = self.zoom;
         let (resp, painter) = ui.allocate_painter(Vec2::new(w as f32 * z, h as f32 * z), Sense::click_and_drag());
         let origin = resp.rect.min;
@@ -414,8 +439,6 @@ impl PumpEditor {
         }
         if changed {
             s.cooler_layout = Some(lcdscene::items_to_json(&self.items));
-            // Отметка «в каких координатах записано»: служба подгонит раскладку под настоящий экран помпы.
-            s.cooler_layout_base = Some([self.base.0, self.base.1]);
         }
         changed
     }
@@ -484,10 +507,9 @@ impl PumpEditor {
         self.drag_off = None;
         self.group_drag = None;
         self.rubber = None;
-        self.group.retain(|g| *g < self.items.len());
-        if self.group.len() < 2 {
-            self.group.clear();
-        }
+        // Номера группы относятся к раскладке до шага истории: после отмены перестановки или удаления
+        // они указывали бы на другие объекты (и «Удалить» стёрло бы невыделенное) — группу снимаем.
+        self.group.clear();
         if self.sel.map(|i| i >= self.items.len()).unwrap_or(false) {
             self.sel = None;
         }
@@ -637,6 +659,35 @@ mod tests {
         for (i, item) in before.iter().enumerate() {
             assert_eq!(after[moved_index(i, from, to)], *item, "{from}->{to}, объект {item}");
         }
+    }
+
+    #[test]
+    fn editor_works_in_panel_coordinates() {
+        use super::PumpEditor;
+        use crate::settings::Settings;
+        // Экран 640×480 выбран вручную: сцена — 640×480, тема подогнана под неё.
+        let mut s = Settings { cooler_size: 4, ..Settings::default() };
+        let small = PumpEditor::new(&Settings::default());
+        let big = PumpEditor::new(&s);
+        assert_eq!((small.base, big.base), ((320, 240), (640, 480)));
+        assert_eq!(big.items[0].scale, (small.items[0].scale * 2.0 * 100.0).round_ties_even() / 100.0);
+        // Своя раскладка (в том числе из C#) уже в координатах экрана — берётся как есть.
+        s.cooler_layout = Some(serde_json::json!([{"Kind": 9, "X": 376, "Y": 40, "Scale": 2, "Text": "A"}]));
+        let saved = PumpEditor::new(&s);
+        assert_eq!((saved.items[0].x, saved.items[0].y, saved.items[0].scale), (376.0, 40.0, 2.0));
+        // Помпа сообщила размер позже: тема пересчитывается, своя раскладка — нет.
+        let auto = Settings::default();
+        let mut e = PumpEditor::new(&auto);
+        e.set_panel(&auto, Some((640, 480)));
+        assert_eq!(e.base, (640, 480));
+        assert_eq!(e.items[0].scale, big.items[0].scale);
+        let mut own = Settings { cooler_layout: s.cooler_layout.clone(), ..Settings::default() };
+        own.cooler_rotation = 90;
+        let mut e = PumpEditor::new(&own);
+        assert_eq!(e.base, (240, 320));
+        e.set_panel(&own, Some((640, 480)));
+        assert_eq!(e.base, (480, 640));
+        assert_eq!((e.items[0].x, e.items[0].scale), (376.0, 2.0));
     }
 
     #[test]

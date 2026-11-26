@@ -55,6 +55,9 @@ fn ask(cmd: &str, timeout: Duration) -> Answer {
 }
 
 fn ask_at(port: u16, cmd: &str, timeout: Duration) -> Answer {
+    // Не соединились — службы нет. В том числе по тайм-ауту: в Windows соединение с портом, который никто
+    // не слушает, не отклоняется сразу, а повторяется около двух секунд, так что «отказ» там выглядит
+    // именно как истёкшие 400 мс. Считать тайм-аут ошибкой нельзя — окно без службы не запускалось бы.
     let Ok(mut s) = TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(400)) else {
         return Answer::Absent;
     };

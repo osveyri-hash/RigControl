@@ -169,9 +169,56 @@ internal sealed class Sensors : IDisposable
     private readonly Dictionary<string, float> _applied = new();
     private readonly object _fanLock = new();
 
+    /// <summary>
+    /// Один помощник на компьютер открывает LibreHardwareMonitor и управляет вентиляторами. Прежний помощник
+    /// (другого процесса — окна или службы — либо не ответивший вовремя и ещё завершающийся) может быть жив:
+    /// два помощника перебивали бы друг другу скорость, а второй запомнил бы ручной режим как «исходный BIOS».
+    /// Мьютекс освобождается сам, когда процесс-владелец завершается. Разовым запросам zen и specs он не нужен.
+    /// </summary>
+    private static Mutex? _owner;
+
+    private static bool TakeOwnership()
+    {
+        if (_owner is not null) return true;
+
+        Mutex mutex;
+        try
+        {
+            mutex = new Mutex(false, @"Global\RigControl-Sensors-Owner");
+        }
+        catch
+        {
+            // Нет доступа к чужому мьютексу (другие права) — проверить нечем, работаем как раньше.
+            return true;
+        }
+
+        try
+        {
+            if (!mutex.WaitOne(0))
+            {
+                mutex.Dispose();
+                return false;
+            }
+        }
+        catch (AbandonedMutexException)
+        {
+            // Прежний владелец завершился, не отпустив, — мьютекс теперь наш.
+        }
+
+        _owner = mutex;
+        return true;
+    }
+
     public Reply Read(bool board)
     {
         var reply = new Reply { Admin = Admin };
+        if (!TakeOwnership())
+        {
+            reply.Ok = false;
+            reply.Error = "другой помощник датчиков RigControl ещё работает — подождите, пока он завершится";
+            return reply;
+        }
+
         Open();
         if (_computer is null)
         {
@@ -312,9 +359,19 @@ internal sealed class Sensors : IDisposable
     /// SetDefault ничего бы не сделал (а канал считался бы возвращённым). Поэтому после неудачи сперва снова
     /// выставляем прежнюю ручную скорость — режим становится Software, — и уже потом возвращаем плате.
     /// </summary>
+    /// <remarks>
+    /// Прежняя скорость — та, на которой вентилятор и так стоял до неудачной попытки: хуже от повторной
+    /// записи не станет. Чего здесь узнать нельзя: Nuvoton и ITE в LibreHardwareMonitor 0.9.6 молча ничего
+    /// не делают, если не смогли занять мьютекс шины ISA (исключения нет) — так же ведёт себя и C#-версия.
+    /// </remarks>
     private static void ReturnToBoard(IControl control, float lastValue)
     {
-        if (control.ControlMode == ControlMode.Default) control.SetSoftware(lastValue);
+        if (control.ControlMode == ControlMode.Default)
+        {
+            // Не удалось — режим всё равно стал Software, и SetDefault ниже попробует вернуть плате.
+            try { control.SetSoftware(lastValue); } catch { /* см. выше */ }
+        }
+
         control.SetDefault();
     }
 

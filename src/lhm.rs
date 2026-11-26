@@ -37,9 +37,12 @@ const SLOW_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Помощник не ответил вовремя: столько ещё ждём, что он дочитает запрос, получит «quit», вернёт
 /// вентиляторы плате и выйдет сам. Снимать его сразу нельзя: исходный режим вентиляторов (как было в BIOS)
 /// LibreHardwareMonitor помнит только в памяти процесса — снятый помощник унёс бы его с собой.
-const RETIRE_GRACE: Duration = Duration::from_secs(60);
+const RETIRE_GRACE: Duration = Duration::from_secs(30);
 /// Не ответивший помощник ещё завершается: нового пока не запускаем (два помощника спорили бы за чип).
 static RETIRING: AtomicBool = AtomicBool::new(false);
+/// Поток, который его дожидается: [`shutdown`] ждёт его конца — нельзя говорить «устройства отданы»
+/// (другой процесс запустил бы своего помощника), пока прежний ещё жив.
+static RETIRE_JOB: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
 /// Канал вентилятора платы (FanInfo в C#). `id` — идентификатор управления в LibreHardwareMonitor.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -267,9 +270,18 @@ fn retire(mut helper: Helper) {
         helper.close(RETIRE_GRACE);
         RETIRING.store(false, Ordering::SeqCst);
     });
-    if spawned.is_err() {
+    match spawned {
+        Ok(job) => *RETIRE_JOB.lock().unwrap_or_else(|e| e.into_inner()) = Some(job),
         // Поток не создался: помощник уже закрыт обычным образом (Drop замыкания).
-        RETIRING.store(false, Ordering::SeqCst);
+        Err(_) => RETIRING.store(false, Ordering::SeqCst),
+    }
+}
+
+/// Дождаться, пока не ответивший помощник выйдет или будет снят (не дольше [`RETIRE_GRACE`] и пары секунд).
+fn wait_retired() {
+    let job = RETIRE_JOB.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(job) = job {
+        let _ = job.join();
     }
 }
 
@@ -282,7 +294,8 @@ fn one_shot(request: &str) -> Result<String, String> {
 }
 
 /// Закрыть помощника (он сам вернёт вентиляторы плате) и пару секунд не запускать его снова —
-/// чтобы окно и служба не держали двух помощников сразу. Ждёт, пока помощник выйдет (до 2 с).
+/// чтобы окно и служба не держали двух помощников сразу. Ждёт, пока помощник выйдет (до 2 с;
+/// если он перед этим не ответил вовремя и ещё завершается — пока не завершится).
 pub fn shutdown() {
     let helper = {
         let mut s = lock();
@@ -292,6 +305,7 @@ pub fn shutdown() {
         s.helper.take()
     };
     drop(helper);
+    wait_retired();
 }
 
 /// Снова можно запускать помощника (после [`shutdown`]).
@@ -523,6 +537,19 @@ mod tests {
         assert!(h.timed_out && e.contains("не ответил"), "{e}");
         assert!(h.close(Duration::from_secs(10)), "помощник должен выйти сам, а не быть снятым");
         assert_eq!(h.child.wait().unwrap().code(), Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_waits_for_a_retiring_helper() {
+        // Единственный тест с общим состоянием модуля (RETIRING / RETIRE_JOB).
+        let mut h = fake_helper("read first; sleep 1; read second; exit 0");
+        assert!(h.call(r#"{"cmd":"read"}"#, Duration::from_millis(100)).is_err());
+        retire(h);
+        assert!(RETIRING.load(Ordering::SeqCst));
+        wait_retired();
+        // Пока помощник не вышел, wait_retired не возвращается — значит, уже вышел.
+        assert!(!RETIRING.load(Ordering::SeqCst));
     }
 
     #[cfg(unix)]

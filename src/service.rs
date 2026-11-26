@@ -314,6 +314,23 @@ pub const SENSOR_PERIOD: Duration = Duration::from_millis(1000);
 /// Размер экрана помпы из настроек (CoolerSize в C#): 0 — по ответу помпы.
 pub const PUMP_SIZES: [(u32, u32); 5] = [(0, 0), (320, 320), (320, 240), (240, 320), (640, 480)];
 
+/// Размер экрана помпы (CoolerPanelSize в C#): выбранный вручную, иначе тот, что сообщила помпа
+/// (detected), иначе 320×240.
+pub fn panel_size(s: &Settings, detected: Option<(u32, u32)>) -> (u32, u32) {
+    PUMP_SIZES
+        .get(s.cooler_size.max(0) as usize)
+        .copied()
+        .filter(|p| p.0 > 0)
+        .or(detected.filter(|p| p.0 > 0 && p.1 > 0))
+        .unwrap_or((320, 240))
+}
+
+/// «320x240» из состояния «Помпа·экран» → размер.
+pub fn parse_panel_size(text: &str) -> Option<(u32, u32)> {
+    let (w, h) = text.trim().split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?)).filter(|p: &(u32, u32)| p.0 > 0 && p.1 > 0)
+}
+
 /// Диагностика помпы для окна: описание, ответ рукопожатия, сколько кадров уходит в секунду.
 fn pump_diag(st: &Status, lcd: &cooler::CoolerLcd, fps: f64) {
     set_status(st, "Помпа·диагностика", format!("{}\n{}\nОтправлено: {fps:.1} кадр/с", lcd.description(), lcd.diagnostics().trim_end()));
@@ -324,9 +341,9 @@ fn pump_loop(s: &Settings, stop: &AtomicBool, st: &Status) -> Result<(), String>
     let mut lcd = cooler::CoolerLcd::open(&api, None)?;
     let opened = Instant::now();
     // Размер экрана выбран вручную — он важнее ответа помпы.
-    if let Some(&(w, h)) = PUMP_SIZES.get(s.cooler_size.max(0) as usize).filter(|p| p.0 > 0) {
-        lcd.resolution = (w, h);
-    }
+    lcd.resolution = panel_size(s, Some(lcd.resolution));
+    // Редактору сцены: он работает в настоящем размере экрана, как и вывод.
+    set_status(st, "Помпа·экран", format!("{}x{}", lcd.resolution.0, lcd.resolution.1));
     let rot = match s.cooler_rotation { 90 => 90, 180 => 180, 270 => 270, _ => 0 };
     let (pw, ph) = lcd.resolution;
     let mut sent = 0u32;
@@ -376,7 +393,7 @@ fn pump_loop(s: &Settings, stop: &AtomicBool, st: &Status) -> Result<(), String>
         .and_then(lcdscene::find_theme)
         .unwrap_or_else(lcdscene::default_theme);
     // Своя раскладка из редактора (CoolerLayout), иначе — раскладка темы.
-    let custom = lcdscene::saved_layout(s.cooler_layout.as_ref(), s.cooler_layout_base, w, h);
+    let custom = lcdscene::saved_layout(s.cooler_layout.as_ref());
     let layout_name = if custom.is_some() { "своя раскладка" } else { "раскладка темы" };
     let items = custom.unwrap_or_else(|| lcdscene::layout_for(&theme, w, h));
     // Фон: своя картинка или картинка темы (pack://…); гифка проигрывается.
@@ -489,6 +506,18 @@ pub fn reset_pump_usb() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panel_size_prefers_manual_choice() {
+        let mut s = Settings::default();
+        assert_eq!(panel_size(&s, None), (320, 240));
+        assert_eq!(panel_size(&s, Some((640, 480))), (640, 480));
+        s.cooler_size = 1; // 320×320 вручную
+        assert_eq!(panel_size(&s, Some((640, 480))), (320, 320));
+        assert_eq!(parse_panel_size("640x480"), Some((640, 480)));
+        assert_eq!(parse_panel_size("0x480"), None);
+        assert_eq!(parse_panel_size("мусор"), None);
+    }
 
     #[test]
     fn rearm_after_pause_or_keep_alive() {
