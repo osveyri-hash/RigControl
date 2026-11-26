@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Помощник датчиков для rigcontrol-rs: LibreHardwareMonitor в отдельном процессе (см. Program.cs).
+       Собирает build.bat: dotnet publish -c Release -o target\release\sensors -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>rigcontrol-sensors</AssemblyName>
+    <RootNamespace>RigControl.Sensors</RootNamespace>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- Поменьше памяти, как у RigControl.csproj: рабочая станция, не серверный GC. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <!-- Меньше памяти в фоне: без фонового сборщика мусора и без таблиц ICU (числа и даты — инвариантные). -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.GC.ConserveMemory" Value="7" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Та же версия, что у RigControl 2.17.3 (C#): с ней проверено управление вентиляторами. -->
+    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
+  </ItemGroup>
+
+</Project>
