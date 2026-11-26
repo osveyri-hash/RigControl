@@ -420,8 +420,19 @@ impl PumpEditor {
         changed
     }
 
-    /// Выделить один объект. Группа хранит номера объектов: после добавления, копии и смены порядка
-    /// они указывали бы на другие объекты (и «Удалить» стёрло бы не то), поэтому группу снимаем.
+    /// Объект переставили с места from на место to («На передний / задний план»). Группа хранит номера
+    /// объектов, поэтому их надо пересчитать: иначе они указывали бы на другие объекты и «Удалить»
+    /// стёрло бы не то. Группа остаётся выделенной (в C# выделение хранит сами объекты).
+    fn moved(&mut self, from: usize, to: usize) {
+        for g in &mut self.group {
+            *g = moved_index(*g, from, to);
+        }
+        self.sel = Some(to);
+        self.group_drag = None;
+        self.drag_off = None;
+    }
+
+    /// Выделить один объект (после «Добавить» и «Копия»): прежнюю группу снимаем.
     fn select_only(&mut self, index: usize) {
         self.sel = Some(index);
         self.group.clear();
@@ -581,12 +592,12 @@ impl PumpEditor {
             if ui.button("На передний план").clicked() && i + 1 < self.items.len() {
                 let it = self.items.remove(i);
                 self.items.push(it);
-                self.select_only(self.items.len() - 1);
+                self.moved(i, self.items.len() - 1);
             }
             if ui.button("На задний план").clicked() && i > 0 {
                 let it = self.items.remove(i);
                 self.items.insert(0, it);
-                self.select_only(0);
+                self.moved(i, 0);
             }
             if ui.button("По центру").clicked() {
                 let snap = crate::telemetry::live().unwrap_or_else(lcdscene::sample_snapshot);
@@ -596,5 +607,45 @@ impl PumpEditor {
                 self.items[j].x = ((w as f64 - bw) / 2.0).round();
             }
         });
+    }
+}
+
+/// Новый номер объекта index после того, как объект с места from переставили на место to
+/// (остальные сдвинулись на одно место навстречу).
+fn moved_index(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < to && index > from && index <= to {
+        index - 1
+    } else if to < from && index >= to && index < from {
+        index + 1
+    } else {
+        index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::moved_index;
+
+    /// Переставить, как это делает редактор, и проверить, что номера указывают на те же объекты.
+    fn check(from: usize, to: usize) {
+        let before = vec!['A', 'B', 'C', 'D', 'E'];
+        let mut after = before.clone();
+        let it = after.remove(from);
+        after.insert(to, it);
+        for (i, item) in before.iter().enumerate() {
+            assert_eq!(after[moved_index(i, from, to)], *item, "{from}->{to}, объект {item}");
+        }
+    }
+
+    #[test]
+    fn group_indices_follow_objects_after_reorder() {
+        for from in 0..5 {
+            check(from, 4); // на передний план
+            check(from, 0); // на задний план
+        }
+        // Пример из разбора ошибки: [A,B,C,D], выделены A и B, B — на передний план → [A,C,D,B].
+        assert_eq!([0usize, 1].map(|g| moved_index(g, 1, 3)), [0, 3]);
     }
 }
