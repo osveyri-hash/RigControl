@@ -9,10 +9,16 @@ pub const UNSAFE_LOCATION_NOTE: &str = "Внимание: rigcontrol.exe или 
 
 /// Упрощённая проверка IsProtectedLocation: exe лежит в Program Files / Windows.
 pub fn is_protected_location(exe: &std::path::Path) -> bool {
-    let p = exe.to_string_lossy().to_lowercase();
-    ["PROGRAMFILES", "PROGRAMFILES(X86)", "WINDIR"].iter().any(|v| {
-        std::env::var(v).map(|d| !d.is_empty() && p.starts_with(&d.to_lowercase())).unwrap_or(false)
-    })
+    let p = exe.to_string_lossy();
+    ["PROGRAMFILES", "PROGRAMFILES(X86)", "WINDIR"].iter().any(|v| std::env::var(v).is_ok_and(|d| is_inside(&p, &d)))
+}
+
+/// Путь лежит внутри папки root (а не в соседней с похожим именем: «C:\Program Files-user» и
+/// «C:\Windows-old» не защищены только оттого, что начинаются так же).
+fn is_inside(path: &str, root: &str) -> bool {
+    let norm = |s: &str| s.replace('/', "\\").to_lowercase();
+    let root = norm(root.trim()).trim_end_matches('\\').to_string();
+    !root.is_empty() && norm(path).starts_with(&(root + "\\"))
 }
 
 fn xml_escape(s: &str) -> String {
@@ -92,6 +98,34 @@ fn decode(bytes: &[u8]) -> String {
     }
 }
 
+/// XML задачи через COM планировщика, в UTF-8 (TaskXml в C#): schtasks печатает в кодировке консоли,
+/// и кириллица в пути («C:\Users\Иван\…») ломается — своя же задача выглядела бы чужой.
+#[cfg(windows)]
+fn task_xml_via_com() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let script = format!(
+        "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=New-Object Text.UTF8Encoding($false); \
+         $s=New-Object -ComObject Schedule.Service; $s.Connect(); \
+         [Console]::Out.Write($s.GetFolder('\\').GetTask('{TASK_NAME}').Xml)"
+    );
+    let out = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .creation_flags(0x0800_0000)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok().map(|s| s.trim_start_matches('\u{FEFF}').to_string()).filter(|s| !s.trim().is_empty())
+}
+
+/// Вывод schtasks читается точно: это UTF-16 или в нём только ASCII (кодировка консоли не важна).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn decodes_exactly(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xFE]) || (bytes.len() > 8 && bytes[1] == 0 && bytes[3] == 0) || bytes.is_ascii()
+}
+
 #[cfg(windows)]
 pub fn status() -> Status {
     use std::os::windows::process::CommandExt;
@@ -104,7 +138,9 @@ pub fn status() -> Status {
     if !out.status.success() {
         return Status::Off;
     }
-    let Some(cmd) = task_command(&decode(&out.stdout)) else { return Status::Other("?".into()) };
+    // В пути есть не-ASCII — спрашиваем планировщик через COM (точный текст); не вышло — как раньше.
+    let xml = if decodes_exactly(&out.stdout) { None } else { task_xml_via_com() }.unwrap_or_else(|| decode(&out.stdout));
+    let Some(cmd) = task_command(&xml) else { return Status::Other("?".into()) };
     let lower = |p: std::io::Result<std::path::PathBuf>| p.map(|p| p.to_string_lossy().to_lowercase()).unwrap_or_default();
     let (target, this) = (lower(target_exe()), lower(std::env::current_exe()));
     let cmd_l = cmd.to_lowercase();
@@ -138,8 +174,7 @@ pub fn set(enable: bool, args: &str) -> Result<String, String> {
     // schtasks /XML ждёт UTF-16 LE с BOM.
     let mut bytes = vec![0xFF, 0xFE];
     for u in xml.encode_utf16() { bytes.extend_from_slice(&u.to_le_bytes()); }
-    let tmp = std::env::temp_dir().join("rigcontrol-task.xml");
-    std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    let tmp = write_task_file(&bytes)?;
     let tmp_s = tmp.to_string_lossy().to_string();
     let code = schtasks(&["/Create", "/TN", TASK_NAME, "/XML", &tmp_s, "/F"]);
     let _ = std::fs::remove_file(&tmp);
@@ -152,6 +187,51 @@ pub fn set(enable: bool, args: &str) -> Result<String, String> {
         msg.push_str(UNSAFE_LOCATION_NOTE);
     }
     Ok(msg)
+}
+
+/// Файл задачи для schtasks (WriteTaskFile в C#). Задача получит наивысшие права, поэтому файл не должны
+/// подменить между записью и чтением: кладём его в C:\Windows\Temp (обычные программы чужие файлы там
+/// не читают и не меняют), имя случайное, а create_new не откроет файл, подложенный заранее.
+/// Нет доступа к C:\Windows\Temp — временная папка пользователя (как в C#).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn write_task_file(bytes: &[u8]) -> Result<std::path::PathBuf, String> {
+    let windows_temp = std::env::var_os("WINDIR").filter(|d| !d.is_empty()).map(|d| std::path::PathBuf::from(d).join("Temp"));
+    write_task_file_in(windows_temp.into_iter().chain([std::env::temp_dir()]), bytes)
+}
+
+fn write_task_file_in(folders: impl IntoIterator<Item = std::path::PathBuf>, bytes: &[u8]) -> Result<std::path::PathBuf, String> {
+    use std::io::Write;
+    let mut last = String::from("нет папки для временного файла");
+    for folder in folders {
+        let path = folder.join(format!("RigControl-task-{}.xml", random_name()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0); // пока пишем — никому не открыть
+        }
+        match options.open(&path).and_then(|mut f| f.write_all(bytes).and_then(|()| f.flush())) {
+            Ok(()) => return Ok(path),
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                last = format!("{}: {e}", path.display());
+            }
+        }
+    }
+    Err(format!("Не удалось записать файл задачи автозапуска ({last})."))
+}
+
+/// 32 случайные шестнадцатеричные цифры (как Guid «N»): имя временного файла нельзя угадать заранее.
+fn random_name() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    // RandomState берёт случайные ключи у ОС; два независимых состояния — 128 бит.
+    let part = || {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.finish()
+    };
+    format!("{:016x}{:016x}", part(), part())
 }
 
 #[cfg(not(windows))]
@@ -167,6 +247,44 @@ pub fn set(_enable: bool, _args: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn protected_location_needs_a_path_boundary() {
+        use super::is_inside;
+        assert!(is_inside("C:\\Program Files\\RigControl-rs\\rigcontrol-gui.exe", "C:\\Program Files"));
+        assert!(is_inside("c:/program files/RigControl/x.exe", "C:\\Program Files\\"));
+        // Соседние папки с тем же началом имени — не Program Files и не Windows.
+        assert!(!is_inside("C:\\Program Files-user\\RigControl.exe", "C:\\Program Files"));
+        assert!(!is_inside("C:\\Windows-old\\RigControl.exe", "C:\\Windows"));
+        assert!(!is_inside("C:\\Program Files", "C:\\Program Files"));
+        assert!(!is_inside("C:\\x.exe", ""));
+    }
+
+    #[test]
+    fn task_file_has_random_name_and_is_never_reused() {
+        let dir = std::env::temp_dir().join(format!("rigcontrol-autostart-test-{}", super::random_name()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = super::write_task_file_in([dir.clone()], b"one").unwrap();
+        let b = super::write_task_file_in([dir.clone()], b"two").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(std::fs::read(&a).unwrap(), b"one");
+        assert_eq!(std::fs::read(&b).unwrap(), b"two");
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("RigControl-task-") && name.ends_with(".xml") && name.len() == "RigControl-task-.xml".len() + 32);
+        // Первая папка недоступна — берётся следующая.
+        let c = super::write_task_file_in([dir.join("нет-такой"), dir.clone()], b"three").unwrap();
+        assert_eq!(c.parent(), Some(dir.as_path()));
+        assert!(super::write_task_file_in([dir.join("нет-такой")], b"x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_exact_output_skips_the_scheduler_query() {
+        // UTF-16 и чистый ASCII читаются точно; однобайтная кириллица консоли — нет.
+        assert!(super::decodes_exactly(b"<Task><Command>C:\\Program Files\\R\\r.exe</Command></Task>"));
+        assert!(super::decodes_exactly(&[0xFF, 0xFE, b'<', 0]));
+        assert!(!super::decodes_exactly(&[b'C', b':', b'\\', 0x88, 0xA2, 0xA0, 0xAD, b'\\', b'r', b'.', b'e', b'x', b'e']));
+    }
+
     #[test]
     fn xml_escapes_path() {
         let x = super::task_xml("C:/A&B/rigcontrol.exe", "profile apply \"Игры\"");

@@ -246,12 +246,16 @@ fn tick(config: &FanConfig, last: &mut BTreeMap<String, f64>, applied: &mut bool
         }
         targets.insert(f.id.clone(), target);
     }
+    let mut failed = false;
     if !targets.is_empty() {
         if let Err(e) = lhm::apply_fans(&targets) {
             st.error = Some(e);
+            failed = true;
         }
     }
-    *applied = targets.values().any(Option::is_some);
+    // Не удалось отдать канал плате — не считаем, что отдали: следующий шаг повторит (иначе поток
+    // перестал бы опрашивать плату, а вентилятор остался бы на последней заданной скорости).
+    *applied = targets.values().any(Option::is_some) || (failed && *applied);
     *ids = fans.iter().map(|f| f.id.clone()).collect();
     st.fans = fans;
     st

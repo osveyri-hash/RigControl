@@ -50,6 +50,13 @@ pub fn evaluate(points: &[(f64, f64)], temp: f64) -> f64 {
     points[points.len() - 1].1
 }
 
+/// Что показать у отметки текущей температуры (FanCurveEditor.OnRender): с 90 °C вентилятор получает
+/// 100 % (защита от перегрева в fans::fan_target), и никогда — ниже пола.
+pub fn readout_percent(points: &[(f64, f64)], temp: f64, floor: f64) -> f64 {
+    let p = if temp >= 90.0 { 100.0 } else { evaluate(points, temp) };
+    p.max(floor)
+}
+
 /// FanCurveOf: плоский массив [T0, P0, T1, P1, …] из settings.json → точки (или кривая по умолчанию).
 pub fn from_flat(flat: Option<&Vec<i32>>) -> Vec<(f64, f64)> {
     match flat {
@@ -173,12 +180,13 @@ pub fn editor(ui: &mut egui::Ui, id_salt: &str, points: &mut Vec<(f64, f64)>, te
         line.push(to_screen(MAX_T, last.1));
         painter.add(Shape::line(line, Stroke::new(2.0_f32, TEXT)));
     }
-    if let Some(t) = temp {
-        let t = t.clamp(MIN_T, MAX_T);
+    if let Some(actual) = temp {
+        let t = actual.clamp(MIN_T, MAX_T);
         painter.extend(Shape::dashed_line(&[to_screen(t, MIN_P), to_screen(t, MAX_P)], Stroke::new(1.0_f32, MINT), 3.0, 3.0));
-        let p = evaluate(points.as_slice(), t);
+        // То, что вентилятор получит на самом деле (fans::fan_target): с 90 °C — 100 %, и не ниже пола.
+        let p = readout_percent(points.as_slice(), actual, floor);
         painter.circle_filled(to_screen(t, p), 4.0, MINT);
-        painter.text(to_screen(t, MAX_P) + Vec2::new(4.0, 0.0), Align2::LEFT_TOP, format!("{t:.0} °C → {p:.0} %"), font.clone(), MINT);
+        painter.text(to_screen(t, MAX_P) + Vec2::new(4.0, 0.0), Align2::LEFT_TOP, format!("{actual:.0} °C → {p:.0} %"), font.clone(), MINT);
     }
     for (i, &(t, p)) in points.iter().enumerate() {
         let r = if hover == Some(i) { 6.5 } else { 5.0 };
@@ -193,6 +201,14 @@ pub fn editor(ui: &mut egui::Ui, id_salt: &str, points: &mut Vec<(f64, f64)>, te
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readout_shows_overheat_override_and_floor() {
+        let flat = [(30.0, 20.0), (100.0, 20.0)];
+        assert_eq!(readout_percent(&flat, 95.0, 20.0), 100.0);
+        assert_eq!(readout_percent(&flat, 89.0, 20.0), 20.0);
+        assert_eq!(readout_percent(&flat, 50.0, 35.0), 35.0);
+    }
 
     #[test]
     fn evaluate_like_csharp() {

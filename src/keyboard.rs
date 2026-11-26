@@ -65,7 +65,8 @@ impl Keyboard {
             Keyboard::Radio(d) => {
                 let r = d.send_light(mode, c.0, c.1, c.2, rainbow, brightness, speed, direction);
                 if r.is_ok() {
-                    crate::light_mirror::effect(mode, c.0, c.1, c.2, rainbow, brightness, speed, direction, false);
+                    // Каждый пакет по радио начинает анимацию заново — и часы схемы/вентиляторов тоже (SendLight в C#).
+                    crate::light_mirror::effect(mode, c.0, c.1, c.2, rainbow, brightness, speed, direction, true);
                 }
                 r
             }
@@ -75,7 +76,9 @@ impl Keyboard {
     /// Своя раскраска по клавишам (таблица 576 байт).
     pub fn set_user_light(&mut self, frame: &[u8]) -> Result<(), String> {
         let result = match self {
-            Keyboard::Wired(d) => d.set_key_colors(frame, true, true),
+            // Сначала режим 0x80, потом таблица (Ak820Device.SetUserLight): одна таблица без режима
+            // оставляет гореть прежний эффект.
+            Keyboard::Wired(d) => d.set_user_light(frame),
             Keyboard::Radio(d) => d.set_user_light(frame),
         };
         if result.is_ok() {

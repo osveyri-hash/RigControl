@@ -53,12 +53,19 @@ impl BatteryWatch {
                         slept += Duration::from_millis(250);
                     }
                     wait = Duration::from_secs(15);
-                    let level = read_once();
-                    match level {
-                        Some(l) => last = Some(l),
-                        // нет донгла — прячем; не ответила один раз — держим прошлое (могла задремать)
-                        None if !dongle_present() => last = None,
-                        None => {}
+                    if crate::kb_light::cable_present() {
+                        // По кабелю заряд не узнать (клавиатура отвечает о нём только по радио), и она
+                        // заряжается: прошлое показание прячем, предупреждение взводим заново — как
+                        // ShowBattery(null, wired: true) в C#. Иначе с донглом в USB так и висел бы старый процент.
+                        last = None;
+                        warned = false;
+                    } else {
+                        match read_once() {
+                            Some(l) => last = Some(l),
+                            // нет донгла — прячем; не ответила один раз — держим прошлое (могла задремать)
+                            None if !dongle_present() => last = None,
+                            None => {}
+                        }
                     }
                     let mut warn = false;
                     if let Some(p) = last {

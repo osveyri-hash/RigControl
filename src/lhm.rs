@@ -15,7 +15,8 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,12 @@ use serde::Deserialize;
 const FRESH: Duration = Duration::from_millis(700);
 /// После ошибки помощник не перезапускаем столько времени.
 const RETRY: Duration = Duration::from_secs(30);
+/// Сколько ждём ответа на read/fans. Первый read открывает LibreHardwareMonitor (драйвер, шины) — это секунды.
+/// Без предела зависший помощник навсегда держал бы общий замок: вентиляторы замирали на последней
+/// скорости, а [`shutdown`] не мог его закрыть.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
+/// zen (ожидание PCI до 5 с) и specs (WMI) отвечают дольше.
+const SLOW_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Канал вентилятора платы (FanInfo в C#). `id` — идентификатор управления в LibreHardwareMonitor.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -88,7 +95,8 @@ pub fn note(r: &Reading) -> Option<String> {
 struct Helper {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Строки ответов: stdout читает отдельный поток, чтобы ждать ответ не дольше заданного.
+    replies: Receiver<std::io::Result<String>>,
 }
 
 fn helper_path() -> Option<PathBuf> {
@@ -102,38 +110,63 @@ fn helper_path() -> Option<PathBuf> {
 impl Helper {
     fn spawn() -> Result<Self, String> {
         let path = helper_path().ok_or("не найдена папка программы")?;
+        Self::spawn_at(&path)
+    }
+
+    fn spawn_at(path: &std::path::Path) -> Result<Self, String> {
         if !path.exists() {
             return Err(format!(
                 "нет помощника датчиков {} — соберите build.bat (нужен .NET 8 SDK)",
                 path.display()
             ));
         }
-        let mut cmd = Command::new(&path);
+        Self::spawn_command(Command::new(path), &path.display().to_string())
+    }
+
+    fn spawn_command(mut cmd: Command, name: &str) -> Result<Self, String> {
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — без окна консоли
         }
-        let mut child = cmd.spawn().map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut child = cmd.spawn().map_err(|e| format!("{name}: {e}"))?;
         let stdin = child.stdin.take().ok_or("нет stdin помощника датчиков")?;
         let stdout = child.stdout.take().ok_or("нет stdout помощника датчиков")?;
-        Ok(Self { child, stdin, stdout: BufReader::new(stdout) })
+        let (tx, replies) = mpsc::channel();
+        let reader = std::thread::Builder::new().name("sensors-reply".into()).spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                let r = stdout.read_line(&mut line);
+                let end = !matches!(r, Ok(n) if n > 0);
+                // Ok(пустая строка) — помощник закрыл stdout.
+                if tx.send(r.map(|_| line)).is_err() || end {
+                    return;
+                }
+            }
+        });
+        if let Err(e) = reader {
+            let _ = child.kill();
+            return Err(format!("помощник датчиков: {e}"));
+        }
+        Ok(Self { child, stdin, replies })
     }
 
-    fn call(&mut self, request: &str) -> Result<String, String> {
+    fn call(&mut self, request: &str, timeout: Duration) -> Result<String, String> {
         let send = |w: &mut ChildStdin| -> std::io::Result<()> {
             w.write_all(request.as_bytes())?;
             w.write_all(b"\n")?;
             w.flush()
         };
         send(&mut self.stdin).map_err(|e| format!("помощник датчиков: {e}"))?;
-        let mut line = String::new();
-        let n = self.stdout.read_line(&mut line).map_err(|e| format!("помощник датчиков: {e}"))?;
-        if n == 0 {
-            return Err("помощник датчиков закрылся".to_string());
+        match self.replies.recv_timeout(timeout) {
+            Ok(Ok(line)) if !line.is_empty() => Ok(line),
+            Ok(Ok(_)) | Err(RecvTimeoutError::Disconnected) => Err("помощник датчиков закрылся".to_string()),
+            Ok(Err(e)) => Err(format!("помощник датчиков: {e}")),
+            // Вызывающий код закроет помощника (см. `call` ниже): ответ мог бы прийти позже и сбить протокол.
+            Err(RecvTimeoutError::Timeout) => Err(format!("помощник датчиков не ответил за {} с", timeout.as_secs())),
         }
-        Ok(line)
     }
 }
 
@@ -165,7 +198,7 @@ fn lock() -> MutexGuard<'static, Shared> {
     SHARED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn call(s: &mut Shared, request: &str) -> Result<String, String> {
+fn call(s: &mut Shared, request: &str, timeout: Duration) -> Result<String, String> {
     if s.helper.is_none() {
         if s.retry_at.is_some_and(|t| Instant::now() < t) {
             return Err(s.error.clone().unwrap_or_else(|| "помощник датчиков недоступен".to_string()));
@@ -180,7 +213,7 @@ fn call(s: &mut Shared, request: &str) -> Result<String, String> {
         }
     }
     let result = match s.helper.as_mut() {
-        Some(h) => h.call(request),
+        Some(h) => h.call(request, timeout),
         None => Err("помощник датчиков недоступен".to_string()),
     };
     if let Err(e) = &result {
@@ -223,7 +256,7 @@ pub fn read(board: bool) -> Result<Reading, String> {
         }
     }
     let request = if board { r#"{"cmd":"read","board":true}"# } else { r#"{"cmd":"read","board":false}"# };
-    let line = call(&mut s, request)?;
+    let line = call(&mut s, request, REPLY_TIMEOUT)?;
     let r: Reading = serde_json::from_str(line.trim()).map_err(|e| format!("помощник датчиков: {e}"))?;
     if !r.ok {
         let e = r.error.unwrap_or_else(|| "LibreHardwareMonitor не открылся".to_string());
@@ -339,14 +372,14 @@ fn payload<T: serde::de::DeserializeOwned>(line: &str, key: &str) -> Result<T, S
 /// Curve Optimizer и тайминги ОЗУ (только чтение, через PawnIO). Меняются только из BIOS — читать редко.
 pub fn zen() -> Result<ZenReport, String> {
     let mut s = lock();
-    let line = call(&mut s, r#"{"cmd":"zen"}"#)?;
+    let line = call(&mut s, r#"{"cmd":"zen"}"#, SLOW_REPLY_TIMEOUT)?;
     payload(&line, "zen")
 }
 
 /// Характеристики ПК из реестра и WMI и паспорт известной модели (это сотни миллисекунд — читать один раз).
 pub fn specs() -> Result<SystemSpecs, String> {
     let mut s = lock();
-    let line = call(&mut s, r#"{"cmd":"specs"}"#)?;
+    let line = call(&mut s, r#"{"cmd":"specs"}"#, SLOW_REPLY_TIMEOUT)?;
     payload(&line, "specs")
 }
 
@@ -354,7 +387,7 @@ pub fn specs() -> Result<SystemSpecs, String> {
 pub fn apply_fans(targets: &BTreeMap<String, Option<f64>>) -> Result<(), String> {
     let request = serde_json::json!({ "cmd": "fans", "targets": targets }).to_string();
     let mut s = lock();
-    let line = call(&mut s, &request)?;
+    let line = call(&mut s, &request, REPLY_TIMEOUT)?;
     let v: serde_json::Value = serde_json::from_str(line.trim()).map_err(|e| format!("помощник датчиков: {e}"))?;
     if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
         Ok(())
@@ -398,6 +431,42 @@ mod tests {
         assert_eq!(s.rows.len(), 1);
         assert_eq!(s.cpu.unwrap().tj_max_c, 95.0);
         assert!(payload::<SystemSpecs>(r#"{"ok":false,"error":"нет"}"#, "specs").is_err());
+    }
+
+    /// Поддельный помощник: команда оболочки (только Unix — на Windows его заменил бы .exe).
+    #[cfg(unix)]
+    fn fake_helper(body: &str) -> Helper {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(body);
+        Helper::spawn_command(cmd, "sh").unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_answers_line_by_line() {
+        let mut h = fake_helper(r#"while read line; do echo "{\"ok\":true}"; done"#);
+        for _ in 0..3 {
+            assert_eq!(h.call(r#"{"cmd":"read"}"#, Duration::from_secs(5)).unwrap().trim(), r#"{"ok":true}"#);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn silent_helper_times_out_instead_of_hanging() {
+        // Читает запрос и молчит: раньше вызов ждал ответа вечно, держа общий замок.
+        let mut h = fake_helper("read line; sleep 30");
+        let started = Instant::now();
+        let e = h.call(r#"{"cmd":"read"}"#, Duration::from_millis(300)).unwrap_err();
+        assert!(e.contains("не ответил"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_helper_is_an_error() {
+        let mut h = fake_helper("exit 0");
+        let e = h.call(r#"{"cmd":"read"}"#, Duration::from_secs(5)).unwrap_err();
+        assert!(e.contains("закрылся") || e.contains("помощник датчиков"), "{e}");
     }
 
     #[test]

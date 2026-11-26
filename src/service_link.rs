@@ -7,6 +7,8 @@
 //!
 //! Обмен — строки по 127.0.0.1:PORT (этот же порт — замок «одна служба»):
 //! `RIGCONTROL-SERVICE PING` → `OK`; `… PAUSE` → `PAUSED` (и держать соединение); `… QUIT` → `OK`.
+//! `BUSY` вместо `PAUSED`/`OK` — служба не успела остановить устройства за отведённое время:
+//! считать, что она их отдала, нельзя (иначе ими управляли бы два процесса сразу).
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -78,14 +80,19 @@ impl Pause {
     }
 }
 
-/// Поставить запущенную службу на паузу: ждём, пока она отдаст устройства (до 15 с). None — службы нет.
-pub fn pause() -> Option<Pause> {
-    let (s, r) = ask("PAUSE", Duration::from_secs(15))?;
-    if r != "PAUSED" {
-        return None;
+/// Поставить запущенную службу на паузу: ждём, пока она отдаст устройства (до 15 с).
+/// Ok(None) — службы нет; Err — служба есть, но устройства не отдала (запускать свои потоки нельзя).
+pub fn pause() -> Result<Option<Pause>, String> {
+    let Some((s, r)) = ask("PAUSE", Duration::from_secs(15)) else { return Ok(None) };
+    match r.as_str() {
+        "PAUSED" => {
+            let _ = s.set_read_timeout(None);
+            Ok(Some(Pause { stream: s }))
+        }
+        "" => Err("служба не ответила за 15 с".into()),
+        "BUSY" => Err("служба не успела остановить устройства".into()),
+        other => Err(format!("неожиданный ответ «{other}»")),
     }
-    let _ = s.set_read_timeout(None);
-    Some(Pause { stream: s })
 }
 
 /// Запустить службу отдельным процессом (она переживёт закрытие окна).
@@ -121,7 +128,12 @@ fn command(line: &str) -> Option<&str> {
     line.trim().strip_prefix(MAGIC).map(str::trim)
 }
 
-fn handle(mut s: TcpStream, tx: Sender<Request>) {
+fn handle(s: TcpStream, tx: Sender<Request>) {
+    handle_with(s, tx, Duration::from_secs(14), Duration::from_secs(10));
+}
+
+/// pause_wait / quit_wait — сколько ждать, пока поток устройств всё остановит.
+fn handle_with(mut s: TcpStream, tx: Sender<Request>, pause_wait: Duration, quit_wait: Duration) {
     let Ok(clone) = s.try_clone() else { return };
     let mut lines = BufReader::new(clone);
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
@@ -132,8 +144,9 @@ fn handle(mut s: TcpStream, tx: Sender<Request>) {
     let quit = |s: &mut TcpStream| {
         let (q, done) = mpsc::channel();
         let _ = tx.send(Request::Quit(Some(q)));
-        let _ = done.recv_timeout(Duration::from_secs(10));
-        let _ = writeln!(s, "OK");
+        // «OK» — только когда устройства действительно остановлены.
+        let reply = if done.recv_timeout(quit_wait).is_ok() { "OK" } else { "BUSY" };
+        let _ = writeln!(s, "{reply}");
     };
     let cmd = command(&line).map(str::to_string);
     match cmd.as_deref() {
@@ -146,7 +159,13 @@ fn handle(mut s: TcpStream, tx: Sender<Request>) {
             if tx.send(Request::Pause(ack)).is_err() {
                 return;
             }
-            let _ = done.recv_timeout(Duration::from_secs(14));
+            // Не успела остановить устройства — так и говорим и паузу снимаем: окно, получив «PAUSED»,
+            // запустило бы свои потоки рядом с ещё работающими потоками службы.
+            if done.recv_timeout(pause_wait).is_err() {
+                let _ = tx.send(Request::Resume);
+                let _ = writeln!(s, "BUSY");
+                return;
+            }
             if writeln!(s, "PAUSED").is_err() {
                 let _ = tx.send(Request::Resume);
                 return;
@@ -175,6 +194,72 @@ fn handle(mut s: TcpStream, tx: Sender<Request>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::Receiver;
+
+    /// Сервер на свободном порту: одно соединение, поток устройств изображает замыкание `devices`.
+    fn serve_once(pause_wait: Duration, devices: impl FnOnce(Receiver<Request>) + Send + 'static) -> TcpStream {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || devices(rx));
+        std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            handle_with(s, tx, pause_wait, pause_wait);
+        });
+        let s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s
+    }
+
+    fn reply(s: &TcpStream) -> String {
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).unwrap();
+        line.trim().to_string()
+    }
+
+    #[test]
+    fn pause_is_confirmed_only_after_devices_stop() {
+        let (resumed_tx, resumed) = mpsc::channel();
+        let mut s = serve_once(Duration::from_secs(5), move |rx| {
+            for r in rx {
+                match r {
+                    Request::Pause(ack) => {
+                        let _ = ack.send(());
+                    }
+                    Request::Resume => {
+                        let _ = resumed_tx.send(());
+                    }
+                    Request::Quit(_) => {}
+                }
+            }
+        });
+        writeln!(s, "{MAGIC} PAUSE").unwrap();
+        assert_eq!(reply(&s), "PAUSED");
+        // Окно закрылось (соединение оборвано) — служба продолжает.
+        drop(s);
+        resumed.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn pause_that_did_not_finish_is_busy_and_resumes() {
+        let (seen_tx, seen) = mpsc::channel();
+        // Поток устройств «завис на остановке»: запрос получил, но не подтверждает.
+        let mut s = serve_once(Duration::from_millis(200), move |rx| {
+            let mut held = Vec::new();
+            for r in rx {
+                let _ = seen_tx.send(match &r {
+                    Request::Pause(_) => "pause",
+                    Request::Resume => "resume",
+                    Request::Quit(_) => "quit",
+                });
+                held.push(r);
+            }
+        });
+        writeln!(s, "{MAGIC} PAUSE").unwrap();
+        assert_eq!(reply(&s), "BUSY");
+        assert_eq!(seen.recv_timeout(Duration::from_secs(5)).unwrap(), "pause");
+        assert_eq!(seen.recv_timeout(Duration::from_secs(5)).unwrap(), "resume");
+    }
 
     #[test]
     fn commands() {

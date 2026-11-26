@@ -60,7 +60,11 @@ foreach ($j in $junk) {
 }
 
 # 3. Бэкапы больше 20 МБ — это бэкапы вместе с target. Пересобираем их без target/bin/obj: код остаётся.
-$skip = '(^|[\\/])(target|bin|obj|\.vs)[\\/]'
+# Папка bin — это сборка .NET, но только не src\bin: там исходники программ (rigcontrol.rs, rigcontrol-gui.rs,
+# rigcontrol-service.rs) — без них бэкап не собрать.
+$skip = '(^|[\\/])(target|obj|\.vs)[\\/]'
+$skipBin = '(^|[\\/])bin[\\/]'
+$sourceBin = '(^|[\\/])src[\\/]bin[\\/]'
 foreach ($zip in Get-ChildItem -LiteralPath $Root -Filter 'rigcontrol-rs-backup-*.zip' -File) {
     if ($zip.Length -lt 20MB) { continue }
     $tmp = $zip.FullName + '.tmp'
@@ -71,6 +75,7 @@ foreach ($zip in Get-ChildItem -LiteralPath $Root -Filter 'rigcontrol-rs-backup-
         try {
             foreach ($e in $src.Entries) {
                 if ($e.FullName -match $skip) { continue }
+                if ($e.FullName -match $skipBin -and $e.FullName -notmatch $sourceBin) { continue }
                 $n = $dst.CreateEntry($e.FullName, [System.IO.Compression.CompressionLevel]::Optimal)
                 $n.LastWriteTime = $e.LastWriteTime
                 if ($e.Length -gt 0 -or -not $e.FullName.EndsWith('/')) {

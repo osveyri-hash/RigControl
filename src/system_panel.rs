@@ -285,6 +285,7 @@ fn worker(state: Arc<Mutex<State>>, wanted: Arc<AtomicBool>, visible: Arc<Atomic
     let specs = crate::lhm::specs().unwrap_or_else(|_| local_specs());
     lock(&state).specs = Some(specs);
     let mut tel = Telemetry::new();
+    tel.read_board = true; // Vcore — с чипа мониторинга платы
     while !stop.load(Ordering::Relaxed) {
         if wanted.load(Ordering::Relaxed) {
             let s = tel.sample();

@@ -39,6 +39,9 @@ pub struct PumpEditor {
     rubber: Option<((f64, f64), (f64, f64))>,
     /// Перетаскивание группы: точка старта и исходные места.
     group_drag: Option<((f64, f64), Vec<(f64, f64)>)>,
+    /// Поле «цвет объекта»: (объект, его цвет на момент синхронизации, что набрано).
+    /// Набранное живёт отдельно от цвета объекта, иначе недописанный «#FF0» стирался бы на следующем кадре.
+    color_draft: Option<(usize, String, String)>,
 }
 
 fn theme_of(s: &Settings) -> lcdscene::LcdTheme {
@@ -58,6 +61,7 @@ impl PumpEditor {
             items, sel: None, drag_off: None, fonts: Fonts::default(), tex: None, sig: String::new(),
             add_kind: LcdKind::Text.index(), bg: None, started: std::time::Instant::now(), base, zoom: 1.5,
             undo: Vec::new(), redo: Vec::new(), last_change: None, group: Vec::new(), rubber: None, group_drag: None,
+            color_draft: None,
         }
     }
 
@@ -77,17 +81,20 @@ impl PumpEditor {
 
     /// Фон на момент t: кадр гифки по времени или картинка. None — градиент.
     fn background(&mut self, s: &Settings) -> Option<(usize, &RgbImage)> {
-        let path = s.cooler_background.clone().filter(|p| !p.trim().is_empty())?;
+        let Some(path) = s.cooler_background.clone().filter(|p| !p.trim().is_empty()) else {
+            // Фон убрали: кадры прежней гифки не нужны (и не должны дёргать перерисовку 25 раз в секунду).
+            self.bg = None;
+            return None;
+        };
         let fresh = matches!(&self.bg, Some((p, sz, _, _)) if *p == path && *sz == self.base);
         if !fresh {
+            // Неудачу тоже запоминаем (пустым списком кадров): иначе битый или пропавший файл
+            // читался бы с диска на каждом кадре окна.
             let frames: Vec<(RgbImage, u64)> = cooler::load_image(Path::new(&path), self.base.0, self.base.1, 0, true)
-                .ok()?
+                .unwrap_or_default()
                 .into_iter()
                 .map(|f| (f.image, u64::from(f.delay_ms.max(20))))
                 .collect();
-            if frames.is_empty() {
-                return None;
-            }
             let total = frames.iter().map(|f| f.1).sum();
             self.bg = Some((path, self.base, frames, total));
         }
@@ -146,7 +153,7 @@ impl PumpEditor {
                 it.x = 16.0;
                 it.y = (h as f64 / 2.0 - 12.0).max(0.0);
                 self.items.push(it);
-                self.sel = Some(self.items.len() - 1);
+                self.select_only(self.items.len() - 1);
             }
             if ui.add_enabled(self.sel.is_some(), egui::Button::new("Удалить")).clicked() {
                 self.delete_selected();
@@ -157,7 +164,7 @@ impl PumpEditor {
                     it.x += 10.0;
                     it.y += 10.0;
                     self.items.push(it);
-                    self.sel = Some(self.items.len() - 1);
+                    self.select_only(self.items.len() - 1);
                 }
             }
             if ui.button("Как в теме").on_hover_text("Сбросить свою раскладку на раскладку выбранной темы").clicked() {
@@ -290,9 +297,13 @@ impl PumpEditor {
         if resp.hovered() {
             let scroll = ui.input(|i| i.raw_scroll_delta.y);
             if scroll != 0.0 {
-                if let Some(i) = self.sel {
-                    let it = &mut self.items[i];
-                    it.scale = (it.scale * if scroll > 0.0 { 1.08 } else { 1.0 / 1.08 }).clamp(0.3, 5.0);
+                if let Some(i) = self.sel.filter(|i| *i < self.items.len()) {
+                    // Колесо меняет размер всех выделенных (OnSceneWheel в C#).
+                    let k = if scroll > 0.0 { 1.08 } else { 1.0 / 1.08 };
+                    for j in self.selection(i) {
+                        let it = &mut self.items[j];
+                        it.scale = (it.scale * k).clamp(0.3, 5.0);
+                    }
                 }
             }
         }
@@ -404,6 +415,24 @@ impl PumpEditor {
         changed
     }
 
+    /// Выделить один объект. Группа хранит номера объектов: после добавления, копии и смены порядка
+    /// они указывали бы на другие объекты (и «Удалить» стёрло бы не то), поэтому группу снимаем.
+    fn select_only(&mut self, index: usize) {
+        self.sel = Some(index);
+        self.group.clear();
+        self.group_drag = None;
+        self.drag_off = None;
+    }
+
+    /// Кого касается правка свойства: вся группа, если главный объект в ней, иначе только он.
+    fn selection(&self, primary: usize) -> Vec<usize> {
+        if self.group.len() > 1 && self.group.contains(&primary) {
+            self.group.iter().copied().filter(|g| *g < self.items.len()).collect()
+        } else {
+            vec![primary]
+        }
+    }
+
     fn delete_selected(&mut self) {
         let mut all: Vec<usize> = std::mem::take(&mut self.group);
         if let Some(i) = self.sel.take() {
@@ -449,6 +478,13 @@ impl PumpEditor {
     }
 
     fn props(&mut self, ui: &mut egui::Ui, i: usize, w: u32, h: u32) {
+        let others: Vec<usize> = self.selection(i).into_iter().filter(|j| *j != i).collect();
+        let was = self.items[i].clone();
+        // Поле цвета: набранное сбрасываем, только когда выделили другой объект или цвет сменили не здесь.
+        let mut draft = match self.color_draft.take() {
+            Some((j, synced, text)) if j == i && synced == was.color => text,
+            _ => was.color.clone(),
+        };
         let it = &mut self.items[i];
         ui.strong(it.kind.title());
         egui::Grid::new("pump_props").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -481,9 +517,10 @@ impl PumpEditor {
                     if crate::color_wheel::wheel_button(ui, ui.next_auto_id(), &mut rgb) {
                         it.color = hex((rgb[0], rgb[1], rgb[2]));
                     }
-                    let mut text = it.color.clone();
-                    if ui.add(egui::TextEdit::singleline(&mut text).desired_width(70.0)).changed() {
-                        if lcdscene::parse_color(&text).is_some() { it.color = text.trim().to_uppercase(); }
+                    if ui.add(egui::TextEdit::singleline(&mut draft).desired_width(70.0)).changed()
+                        && lcdscene::parse_color(&draft).is_some()
+                    {
+                        it.color = draft.trim().to_uppercase();
                     }
                 }
             });
@@ -516,16 +553,35 @@ impl PumpEditor {
                 ui.end_row();
             }
         });
+        // Цвет сменили кругом или флажком «Авто» — показываем его; иначе оставляем набранное.
+        let now = self.items[i].clone();
+        if now.color != was.color && lcdscene::parse_color(&draft).map(hex) != lcdscene::parse_color(&now.color).map(hex) {
+            draft = now.color.clone();
+        }
+        self.color_draft = Some((i, now.color.clone(), draft));
+        // Общие свойства — всем выделенным (ApplyProp в C#); текст и место у каждого свои.
+        for j in others {
+            let o = &mut self.items[j];
+            if now.scale != was.scale && was.scale > 0.0 {
+                // У группы размер меняется во столько же раз, во сколько у главного: пропорции сохраняются.
+                o.scale = (o.scale * now.scale / was.scale).clamp(0.3, 5.0);
+            }
+            if now.color != was.color { o.color = now.color.clone(); }
+            if now.font != was.font { o.font = now.font.clone(); }
+            if now.bold != was.bold { o.bold = now.bold; }
+            if now.label != was.label && o.has_label() { o.label = now.label; }
+            if now.seconds != was.seconds && o.kind == LcdKind::Time { o.seconds = now.seconds; }
+        }
         ui.horizontal(|ui| {
             if ui.button("На передний план").clicked() && i + 1 < self.items.len() {
                 let it = self.items.remove(i);
                 self.items.push(it);
-                self.sel = Some(self.items.len() - 1);
+                self.select_only(self.items.len() - 1);
             }
             if ui.button("На задний план").clicked() && i > 0 {
                 let it = self.items.remove(i);
                 self.items.insert(0, it);
-                self.sel = Some(0);
+                self.select_only(0);
             }
             if ui.button("По центру").clicked() {
                 let snap = crate::telemetry::live().unwrap_or_else(lcdscene::sample_snapshot);

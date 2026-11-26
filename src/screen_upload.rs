@@ -1,11 +1,15 @@
-//! Заливка картинки/гифки на экранчик AK820 Pro в фоновом потоке (для окна):
-//! окно не зависает на несколько секунд и показывает прогресс по порциям, как UploadScreen в C#.
+//! Заливка картинки/гифки на экранчик AK820 Pro в фоне (для окна): окно не зависает на несколько
+//! секунд и показывает прогресс по порциям, как UploadScreen в C#.
 //! Экран заливается только по кабелю (интерфейс данных 0xFF68): донгл 2,4 ГГц его не отдаёт.
+//!
+//! Заливку выполняет поток клавиатуры ([`crate::kb_light::KbLight::upload`]) — тот же, что ведёт
+//! подсветку: сессия заливки (04 18 … 04 02) не должна перемешиваться с пакетами подсветки,
+//! иначе чужой 04 02 обрывает её и на экране остаётся мусор. В C# перед заливкой останавливается
+//! StartLightSync, а устройство сериализует сессии блокировкой.
 
 use crate::device::Ak820Device;
 use crate::protocol::{self, ScreenFrame};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum UploadState {
@@ -16,40 +20,24 @@ pub enum UploadState {
     Failed(String),
 }
 
+/// Ход заливки: окно читает, поток клавиатуры пишет.
+#[derive(Clone)]
 pub struct ScreenUpload {
     state: Arc<Mutex<UploadState>>,
-    handle: Option<JoinHandle<()>>,
 }
 
 impl ScreenUpload {
-    pub fn start(frames: Vec<ScreenFrame>) -> Self {
-        let state = Arc::new(Mutex::new(UploadState::Running { done: 0, total: 0 }));
-        let st = state.clone();
-        let handle = std::thread::spawn(move || {
-            let set = |v: UploadState| { if let Ok(mut g) = st.lock() { *g = v; } };
-            let result = (|| -> Result<String, String> {
-                let count = frames.len().min(protocol::MAX_FRAMES);
-                let blob = protocol::screen_blob(&frames).map_err(|e| e.to_string())?;
-                let api = hidapi::HidApi::new().map_err(|e| format!("hidapi: {e}"))?;
-                let dev = Ak820Device::open(&api)
-                    .map_err(|e| format!("{e}\nКартинки на экран заливаются только по кабелю USB-C."))?;
-                let stats = dev.upload_screen(&blob, |done, total| set(UploadState::Running { done, total }))?;
-                let mut msg = format!(
-                    "Готово: кадров {count}, {} КиБ за {:.1} с (ACK {}/{}).",
-                    blob.len() / 1024, stats.total_seconds, stats.acks, stats.chunks
-                );
-                if stats.acks == 0 {
-                    msg.push_str(" Клавиатура не прислала ни одного ACK — если картинка не сменилась, пришлите это сообщение.");
-                }
-                Ok(msg)
-            })();
-            set(match result { Ok(m) => UploadState::Done(m), Err(e) => UploadState::Failed(e) });
-        });
-        Self { state, handle: Some(handle) }
+    /// Заливка поставлена в очередь потока клавиатуры.
+    pub(crate) fn queued() -> Self {
+        Self { state: Arc::new(Mutex::new(UploadState::Running { done: 0, total: 0 })) }
+    }
+
+    pub(crate) fn set(&self, v: UploadState) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = v;
     }
 
     pub fn state(&self) -> UploadState {
-        self.state.lock().map(|g| g.clone()).unwrap_or(UploadState::Failed("поток заливки упал".into()))
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn running(&self) -> bool {
@@ -57,13 +45,19 @@ impl ScreenUpload {
     }
 }
 
-impl Drop for ScreenUpload {
-    fn drop(&mut self) {
-        // Не бросаем заливку на полпути: прерванная сессия оставляет на экране мусор.
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+/// Залить кадры в открытую по кабелю клавиатуру. Ok — строка итога для окна.
+pub(crate) fn send(dev: &Ak820Device, frames: &[ScreenFrame], progress: &ScreenUpload) -> Result<String, String> {
+    let count = frames.len().min(protocol::MAX_FRAMES);
+    let blob = protocol::screen_blob(frames).map_err(|e| e.to_string())?;
+    let stats = dev.upload_screen(&blob, |done, total| progress.set(UploadState::Running { done, total }))?;
+    let mut msg = format!(
+        "Готово: кадров {count}, {} КиБ за {:.1} с (ACK {}/{}).",
+        blob.len() / 1024, stats.total_seconds, stats.acks, stats.chunks
+    );
+    if stats.acks == 0 {
+        msg.push_str(" Клавиатура не прислала ни одного ACK — если картинка не сменилась, пришлите это сообщение.");
     }
+    Ok(msg)
 }
 
 /// RGB565 little-endian → RGB888 (для предпросмотра в окне).

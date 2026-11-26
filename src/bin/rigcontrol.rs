@@ -601,7 +601,8 @@ fn run_mouse(args: &[String]) -> Result<(), String> {
                     let rates = m.rates();
                     let rate = if m.via_dongle() { c.g_rate } else { c.usb_rate } as usize;
                     let level = if m.via_dongle() { c.g_dpi } else { c.usb_dpi } as usize;
-                    let levels: Vec<String> = (0..c.count as usize).map(|i| {
+                    // У «странного» ответа число уровней может быть больше шести — массивы DPI короче.
+                    let levels: Vec<String> = (0..(c.count as usize).min(c.dpi.len())).map(|i| {
                         let mark = if i == level { "*" } else { "" };
                         if c.dpi_y[i] != c.dpi[i] { format!("{mark}{}x{}", c.dpi[i], c.dpi_y[i]) } else { format!("{mark}{}", c.dpi[i]) }
                     }).collect();
@@ -710,10 +711,12 @@ fn run_mouse(args: &[String]) -> Result<(), String> {
                 .ok_or("Укажите кнопку: left|middle|right|forward|back")?;
             let key = mousekeys::parse_action(args.get(2).ok_or("Укажите функцию: mouse bind back key:ctrl+c")?)?;
             let key = mousekeys::normalize(button, key);
-            // Защита из MainWindow.MouseKeys.cs: нельзя остаться без левого клика.
-            if let Some(cfg) = m.read_config() {
+            // Защита из MainWindow.MouseKeys.cs: нельзя остаться без левого клика. Настройки не прочитались —
+            // проверить нечем, поэтому тоже отказываем (а не пишем вслепую): в C# без настроек кнопки не меняются.
+            if !args.iter().any(|a| a == "--force") {
+                let cfg = need_cfg().map_err(|e| format!("{e}. Без них нельзя проверить, что останется левый клик; добавьте --force, если уверены"))?;
                 let any_left = (0..mousekeys::COUNT).any(|b| mousekeys::is_left_click(b, if b == button { key } else { cfg.keys[b] }));
-                if !any_left && !args.iter().any(|a| a == "--force") {
+                if !any_left {
                     return Err("После этого ни одна кнопка не будет левым кликом. Добавьте --force, если уверены".into());
                 }
             }
@@ -1200,8 +1203,11 @@ fn run_daemon(args: &[String]) -> Result<(), String> {
     let with_fans = !args.iter().any(|a| a == "--no-fans");
     logfile::cleanup_on_startup();
     let s = Settings::load();
+    // Как окно и фоновая служба (host::Devices::start): подгонка скорости эффектов из настроек —
+    // иначе вентиляторы «как клавиатура» шли бы не в такт — и переключатель «Автовывод на помпу».
+    rigcontrol_core::light_mirror::set_rates(s.effect_rates.as_ref());
     // Клавиатура — своим потоком: свои эффекты кадрами по кабелю, слежение за кабелем.
-    let svc = Service::start(&s, false);
+    let svc = Service::start_with(&s, false, s.auto_output);
     let kb = keyboard.then(|| KbLight::start(&s));
     // Вентиляторы — как в окне: режимы и кривые из settings.json. Нужны права администратора;
     // процесс завершился (Ctrl+C, сбой) — помощник датчиков сам отдаёт вентиляторы плате.

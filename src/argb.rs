@@ -150,6 +150,8 @@ pub struct KeyboardSampler {
     pub fans: usize,
     points: Vec<(f64, f64)>,
     ring: Vec<f64>,
+    /// Три ближайшие клавиши каждого светодиода: (код, вес).
+    taps: Vec<[(u8, f64); 3]>,
 }
 
 impl KeyboardSampler {
@@ -160,6 +162,11 @@ impl KeyboardSampler {
         let (w, h) = (keypaint::WIDTH, keypaint::HEIGHT);
         let mut points = Vec::with_capacity(leds);
         let mut ring = Vec::with_capacity(leds);
+        let mut taps = Vec::with_capacity(leds);
+        let keys: Vec<(u8, f64, f64)> = keypaint::KEYS
+            .iter()
+            .map(|k| (k.code, k.x + k.w / 2.0 - keypaint::ORIGIN_X, k.y + k.h / 2.0 - keypaint::ORIGIN_Y))
+            .collect();
         for i in 0..leds {
             let fan = (i / per_fan).min(fans - 1);
             let j = i - fan * per_fan;
@@ -171,8 +178,33 @@ impl KeyboardSampler {
             let py = h / 2.0 + radius * angle.sin();
             points.push((px / w, py / h));
             ring.push(j as f64 / n as f64);
+
+            let mut near: Vec<(u8, f64)> = keys.iter().map(|&(code, x, y)| (code, ((x - px).powi(2) + (y - py).powi(2)).sqrt())).collect();
+            near.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let mut tap = [(0u8, 0.0f64); 3];
+            for (slot, (code, d)) in tap.iter_mut().zip(near) {
+                *slot = (code, 1.0 / (d + 12.0));
+            }
+            taps.push(tap);
         }
-        Self { leds, fans, points, ring }
+        Self { leds, fans, points, ring, taps }
+    }
+
+    /// Цвет светодиода по таблице light_mirror::display ([код, R, G, B] по смещению код×4):
+    /// три ближайшие клавиши с весом по расстоянию (KeyboardSampler.Sample в C#).
+    pub fn sample(&self, table: &[u8], led: usize) -> (f64, f64, f64) {
+        let (mut r, mut g, mut b, mut sum) = (0.0, 0.0, 0.0, 0.0);
+        for &(code, w) in &self.taps[led] {
+            let at = code as usize * 4;
+            if w <= 0.0 || at + 3 >= table.len() {
+                continue;
+            }
+            r += f64::from(table[at + 1]) * w;
+            g += f64::from(table[at + 2]) * w;
+            b += f64::from(table[at + 3]) * w;
+            sum += w;
+        }
+        if sum > 0.0 { (r / sum, g / sum, b / sum) } else { (0.0, 0.0, 0.0) }
     }
 
     /// x, y — 0…1.
@@ -216,6 +248,9 @@ pub fn board_effect_for(c: &ArgbConfig, frame: &[u8]) -> (u8, Rgb) {
 pub struct Renderer {
     temp: f64,
     sampler: Option<KeyboardSampler>,
+    /// «Как клавиатура»: сглаженные цвета светодиодов (R, G, B) и время прошлого кадра.
+    smooth: Vec<f64>,
+    last_t: f64,
 }
 
 impl Default for Renderer {
@@ -226,7 +261,7 @@ impl Default for Renderer {
 
 impl Renderer {
     pub fn new() -> Self {
-        Self { temp: f64::NAN, sampler: None }
+        Self { temp: f64::NAN, sampler: None, smooth: Vec::new(), last_t: f64::NAN }
     }
 
     /// Кадр в полную силу (R, G, B на светодиод) на момент `t` секунд.
@@ -319,20 +354,54 @@ impl Renderer {
                     self.sampler = Some(KeyboardSampler::new(leds, fans));
                 }
                 let s = self.sampler.as_ref().unwrap();
-                let mode = if effects::is_rainbow_flow(c.keyboard_effect) { c.keyboard_effect } else { effects::FLOW };
-                // На клавиатуре горит встроенный эффект прошивки — повторяем его (LightMirror).
-                let firmware = crate::light_mirror::active_effect_mode().is_some();
+                if self.smooth.len() != leds * 3 {
+                    self.smooth = vec![0.0; leds * 3];
+                }
+                // Сглаживание по времени, а не по кадрам (как в C#): при любой частоте кадров — та же мягкость.
+                let dt = if self.last_t.is_nan() { 0.033 } else { (t - self.last_t).clamp(0.0, 0.25) };
+                self.last_t = t;
+                let follow = 1.0 - 0.65f64.powf(dt / 0.033);
+
+                // Что сейчас на клавиатуре (LightMirror), по убыванию точности:
+                // 1) свой радужный эффект — считаем его же в точке светодиода, ровно в такт;
+                // 2) встроенный эффект прошивки — тоже в точке светодиода;
+                // 3) раскраска, анимация раскраски, гифка по клавишам — цвета ближайших клавиш;
+                // 4) программа ещё ничего не отправляла (клавиатуры нет) — радуга по настройкам.
+                let custom = crate::light_mirror::custom_effect();
+                let effect = crate::light_mirror::active_effect_mode();
+                // У «волны от центра» точки сдвинуты к центру: иначе крайние вентиляторы отстают ровно
+                // на целую волну и кажется, что она идёт с краёв.
+                let squeeze = if effect == Some(9) { 0.25 } else { 1.0 };
+                let table = if custom.is_none() && effect.is_none() { crate::light_mirror::display().map(|d| d.0) } else { None };
+                let fallback = if effects::is_rainbow_flow(c.keyboard_effect) { c.keyboard_effect } else { effects::FLOW };
                 for i in 0..leds {
                     let (x, y) = s.position(i);
-                    if firmware {
-                        if let Some(k) = crate::light_mirror::effect_sample(x, y, (i as f64 * 0.618) % 1.0) {
-                            put(rgb, i, f(k.0), f(k.1), f(k.2));
-                            continue;
-                        }
+                    let sm = &mut self.smooth[i * 3..i * 3 + 3];
+                    let exact = if let Some(cu) = &custom {
+                        Some(cu.at(x, y, s.ring(i)))
+                    } else if effect.is_none() && table.is_none() {
+                        Some(effects::rainbow_at(fallback, x, y, Some(s.ring(i)), t, c.keyboard_speed, c.keyboard_dir))
+                    } else {
+                        None
+                    };
+                    if let Some(k) = exact {
+                        // Без сглаживания: формула и время те же, что у клавиатуры.
+                        sm.copy_from_slice(&[f(k.0), f(k.1), f(k.2)]);
+                        put(rgb, i, sm[0], sm[1], sm[2]);
+                        continue;
                     }
-                    // Та же формула и то же время, что у клавиатуры, — цвета идут в такт.
-                    let k = effects::rainbow_at(mode, x, y, Some(s.ring(i)), t, c.keyboard_speed, c.keyboard_dir);
-                    put(rgb, i, f(k.0), f(k.1), f(k.2));
+                    let (r, g, b) = match &table {
+                        Some(table) => s.sample(table, i),
+                        None => {
+                            let (sx, sy) = (0.5 + (x - 0.5) * squeeze, 0.5 + (y - 0.5) * squeeze);
+                            crate::light_mirror::effect_sample(sx, sy, (i as f64 * 0.618) % 1.0)
+                                .map_or((0.0, 0.0, 0.0), |k| (f(k.0), f(k.1), f(k.2)))
+                        }
+                    };
+                    sm[0] += (r - sm[0]) * follow;
+                    sm[1] += (g - sm[1]) * follow;
+                    sm[2] += (b - sm[2]) * follow;
+                    put(rgb, i, sm[0], sm[1], sm[2]);
                 }
             }
         }
@@ -424,6 +493,33 @@ mod tests {
         assert_eq!(s.ring(0), 0.0);
         assert_eq!(s.ring(16), 0.0); // второй вентилятор начинается сверху
         assert!(s.position(0).0 < s.position(16).0 && s.position(16).0 < s.position(32).0);
+    }
+
+    #[test]
+    fn sampler_reads_painted_keys() {
+        // Вся клавиатура закрашена красным — у каждого светодиода красный, а не радуга.
+        let mut table = vec![0u8; 9 * 64];
+        for k in keypaint::KEYS {
+            let at = k.code as usize * 4;
+            table[at..at + 4].copy_from_slice(&[k.code, 200, 10, 0]);
+        }
+        let s = KeyboardSampler::new(24, 2);
+        for led in 0..24 {
+            let (r, g, b) = s.sample(&table, led);
+            assert!((r - 200.0).abs() < 1e-9 && (g - 10.0).abs() < 1e-9 && b == 0.0, "led {led}: {r} {g} {b}");
+        }
+        // Левая половина красная, правая синяя: первый вентилятор красный, второй синий.
+        for k in keypaint::KEYS {
+            let at = k.code as usize * 4;
+            let left = k.x + k.w / 2.0 - keypaint::ORIGIN_X < keypaint::WIDTH / 2.0;
+            table[at + 1..at + 4].copy_from_slice(if left { &[255, 0, 0] } else { &[0, 0, 255] });
+        }
+        let (r, _, b) = s.sample(&table, 9); // левый край первого вентилятора
+        assert!(r > 200.0 && b < 50.0, "{r} {b}");
+        let (r, _, b) = s.sample(&table, 12 + 3); // правый край второго
+        assert!(b > 200.0 && r < 50.0, "{r} {b}");
+        // Короткая таблица — чёрный, без паники.
+        assert_eq!(s.sample(&[], 0), (0.0, 0.0, 0.0));
     }
 
     #[test]

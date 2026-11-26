@@ -375,8 +375,9 @@ pub fn heat(temp: Option<f64>) -> crate::Rgb {
 /// "#RRGGBB" / "RRGGBB" / "#AARRGGBB" (альфа отбрасывается). Пусто или мусор — None.
 pub fn parse_color(text: &str) -> Option<crate::Rgb> {
     let t = text.trim().trim_start_matches('#');
-    let t = if t.len() == 8 { &t[2..] } else { t };
-    if t.len() != 6 { return None; }
+    // Только шестнадцатеричные цифры: срез по байтам на «не-ASCII» тексте паниковал бы посреди символа,
+    // а from_str_radix принял бы знак («+FFFFF»).
+    if !matches!(t.len(), 6 | 8) || !t.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
     let v = u32::from_str_radix(t, 16).ok()?;
     Some(((v >> 16) as u8, (v >> 8) as u8, v as u8))
 }
@@ -657,10 +658,28 @@ pub fn now() -> NaiveDateTime {
     Local::now().naive_local()
 }
 
-/// Растянуть раскладку 320×240 под другой размер (как в C#, если нет отдельной раскладки).
+/// Передвинуть объекты под другой размер сцены, не меняя их величину (поворот экрана в редакторе:
+/// туда и обратно размер объектов не должен «усыхать»).
 pub fn stretch(items: &[LcdItem], from: (f64, f64), to: (f64, f64)) -> Vec<LcdItem> {
     let (kx, ky) = (to.0 / from.0, to.1 / from.1);
     items.iter().map(|i| LcdItem { x: i.x * kx, y: i.y * ky, ..i.clone() }).collect()
+}
+
+/// Подогнать раскладку под экран другого размера, как ThemeItems в C#: места — по осям,
+/// величина объектов — по меньшему из двух коэффициентов (иначе на 640×480 объекты разъезжаются,
+/// оставаясь мелкими).
+pub fn fit(items: &[LcdItem], from: (f64, f64), to: (f64, f64)) -> Vec<LcdItem> {
+    let (kx, ky) = (to.0 / from.0, to.1 / from.1);
+    let ks = kx.min(ky);
+    items
+        .iter()
+        .map(|i| LcdItem {
+            x: (i.x * kx).round_ties_even(),
+            y: (i.y * ky).round_ties_even(),
+            scale: (i.scale * ks * 100.0).round_ties_even() / 100.0,
+            ..i.clone()
+        })
+        .collect()
 }
 
 /// Раскладка темы для сцены w×h (вертикальная — portrait).
@@ -668,12 +687,12 @@ pub fn layout_for(theme: &LcdTheme, w: u32, h: u32) -> Vec<LcdItem> {
     if h > w {
         if let Some(p) = theme.portrait {
             let items = p();
-            return if (w, h) == (240, 320) { items } else { stretch(&items, (240.0, 320.0), (w as f64, h as f64)) };
+            return if (w, h) == (240, 320) { items } else { fit(&items, (240.0, 320.0), (w as f64, h as f64)) };
         }
-        return stretch(&(theme.items)(), (320.0, 240.0), (w as f64, h as f64));
+        return fit(&(theme.items)(), (320.0, 240.0), (w as f64, h as f64));
     }
     let items = (theme.items)();
-    if (w, h) == (320, 240) { items } else { stretch(&items, (320.0, 240.0), (w as f64, h as f64)) }
+    if (w, h) == (320, 240) { items } else { fit(&items, (320.0, 240.0), (w as f64, h as f64)) }
 }
 
 #[cfg(test)]
@@ -782,10 +801,11 @@ pub fn item_from_json(v: &serde_json::Value) -> Option<LcdItem> {
     Some(it)
 }
 
-/// Раскладка из settings.json; None — пусто или не разобралось (тогда берётся тема).
+/// Раскладка из settings.json; None — её нет или это не массив (тогда берётся тема).
+/// Пустой массив — пустая сцена: в редакторе удалили последний объект, и помпа должна показать то же,
+/// а не вернуть объекты темы («Сбросить к теме» записывает None).
 pub fn items_from_json(v: &serde_json::Value) -> Option<Vec<LcdItem>> {
-    let items: Vec<LcdItem> = v.as_array()?.iter().filter_map(item_from_json).collect();
-    if items.is_empty() { None } else { Some(items) }
+    Some(v.as_array()?.iter().filter_map(item_from_json).collect())
 }
 
 pub fn items_to_json(items: &[LcdItem]) -> serde_json::Value {
@@ -806,7 +826,7 @@ pub fn saved_layout(v: Option<&serde_json::Value>, w: u32, h: u32) -> Option<Vec
     let items = items_from_json(v?)?;
     let base = if h > w { (LAYOUT_BASE.1, LAYOUT_BASE.0) } else { LAYOUT_BASE };
     Some(if base == (w, h) { items } else {
-        stretch(&items, (base.0 as f64, base.1 as f64), (w as f64, h as f64))
+        fit(&items, (base.0 as f64, base.1 as f64), (w as f64, h as f64))
     })
 }
 
@@ -911,5 +931,40 @@ mod layout_tests {
         let big = saved_layout(Some(&v), 480, 480).unwrap();
         assert_eq!(big[1].x, 188.0 * 1.5);
         assert!(saved_layout(None, 320, 240).is_none());
+    }
+
+    #[test]
+    fn fit_scales_objects_like_theme_items() {
+        // ThemeItems в C#: X·kx, Y·ky с округлением, Scale·min(kx, ky) до сотых.
+        let items = vec![LcdItem { x: 188.0, y: 81.0, scale: 1.25, ..LcdItem::create(LcdKind::Text) }];
+        let big = fit(&items, (320.0, 240.0), (640.0, 480.0));
+        assert_eq!((big[0].x, big[0].y, big[0].scale), (376.0, 162.0, 2.5));
+        let square = fit(&items, (320.0, 240.0), (320.0, 320.0));
+        assert_eq!(square[0].scale, 1.25); // min(1, 1.33)
+        // Тема под экран 640×480 — тоже крупнее.
+        let theme = default_theme();
+        let base = layout_for(&theme, 320, 240);
+        let large = layout_for(&theme, 640, 480);
+        assert_eq!(large[0].scale, (base[0].scale * 2.0 * 100.0).round_ties_even() / 100.0);
+    }
+
+    #[test]
+    fn empty_layout_is_an_empty_scene() {
+        // Удалили последний объект: это «пусто», а не «вернуть тему».
+        let empty = serde_json::json!([]);
+        assert_eq!(saved_layout(Some(&empty), 320, 240).map(|v| v.len()), Some(0));
+        assert!(items_from_json(&serde_json::json!("мусор")).is_none());
+    }
+
+    #[test]
+    fn parse_color_rejects_garbage_without_panic() {
+        assert_eq!(parse_color("#FF0050"), Some((0xFF, 0x00, 0x50)));
+        assert_eq!(parse_color("80FF0050"), Some((0xFF, 0x00, 0x50)));
+        assert_eq!(parse_color(" ff0050 "), Some((0xFF, 0x00, 0x50)));
+        // 8 байт UTF-8, граница символа посреди среза [2..] — раньше паника.
+        assert_eq!(parse_color("\u{1F3A8}FFFF"), None);
+        assert_eq!(parse_color("жжжж"), None);
+        assert_eq!(parse_color("+FFFFF"), None);
+        assert_eq!(parse_color(""), None);
     }
 }

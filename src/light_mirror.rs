@@ -26,7 +26,9 @@ pub struct EffectState {
     pub brightness: i32,
     pub speed: i32,
     pub direction: i32,
-    since_ms: u64,
+    /// Начало отсчёта эффекта, мс по [`now_ms`]. Со знаком: после подгонки скорости
+    /// начало может оказаться раньше запуска программы (Since в C# — long).
+    since_ms: i64,
 }
 
 #[derive(Default)]
@@ -35,7 +37,34 @@ struct State {
     user: Option<Arc<Vec<u8>>>,
     live: Option<Arc<Vec<u8>>>,
     live_at: u64,
+    custom: Option<CustomEffect>,
     rates: BTreeMap<String, f64>,
+}
+
+/// Свой радужный эффект (спектр, волна от центра, течение, вращение), который программа сейчас
+/// рисует живыми кадрами: вентиляторы «как клавиатура» считают его же в своих точках (CustomState в C#).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CustomEffect {
+    mode: i32,
+    speed: i32,
+    direction: i32,
+    /// Яркость клавиатуры 0…1.
+    scale: f64,
+    /// Начало эффекта, мс по [`now_ms`] (может быть отрицательным).
+    origin_ms: i64,
+}
+
+impl CustomEffect {
+    /// Цвет в точке (x, y — 0…1; ring — место светодиода на кольце вентилятора), как его видно глазом.
+    pub fn at(&self, x: f64, y: f64, ring: f64) -> Rgb {
+        self.at_time((now_ms() as i64 - self.origin_ms) as f64 / 1000.0, x, y, ring)
+    }
+
+    fn at_time(&self, seconds: f64, x: f64, y: f64, ring: f64) -> Rgb {
+        let (r, g, b) = crate::effects::rainbow_at(self.mode, x, y, Some(ring), seconds, self.speed, self.direction);
+        let q = |v: u8| from_led((f64::from(v) * self.scale).round_ties_even().clamp(0.0, 255.0) as u8);
+        (q(r), q(g), q(b))
+    }
 }
 
 fn state() -> &'static Mutex<State> {
@@ -66,7 +95,7 @@ pub fn effect(mode: i32, r: u8, g: u8, b: u8, rainbow: bool, brightness: i32, sp
     // Тот же эффект с другим цветом — анимация продолжается, а не начинается заново.
     let since_ms = match &s.effect {
         Some(old) if !restart && old.mode == mode && old.speed == speed && old.direction == direction => old.since_ms,
-        _ => now_ms(),
+        _ => now_ms() as i64,
     };
     s.effect = Some(EffectState { mode, r, g, b, rainbow, brightness: brightness.clamp(0, 5), speed, direction, since_ms });
     s.user = None;
@@ -85,6 +114,39 @@ pub fn live(frame: &[u8]) {
     let mut s = lock();
     s.live = Some(Arc::new(frame.to_vec()));
     s.live_at = now_ms();
+}
+
+/// Живой кадр — из своего радужного эффекта на момент `seconds` от его начала (LightMirror.Custom в C#).
+/// Любой другой mode (раскраска, гифка по клавишам, не радужный эффект) — «не такой эффект»:
+/// вентиляторы берут цвета клавиш из кадра.
+pub fn custom(mode: i32, speed: i32, direction: i32, scale: f64, seconds: f64) {
+    let mut s = lock();
+    if !crate::effects::is_rainbow_flow(mode) {
+        s.custom = None;
+        return;
+    }
+    let origin_ms = now_ms() as i64 - (seconds * 1000.0).round_ties_even() as i64;
+    // Тот же эффект — часы не дёргаем: разница в пару миллисекунд от кадра к кадру не нужна.
+    if let Some(old) = &s.custom {
+        if old.mode == mode
+            && old.speed == speed
+            && old.direction == direction
+            && (old.scale - scale).abs() < 0.001
+            && (old.origin_ms - origin_ms).abs() < 40
+        {
+            return;
+        }
+    }
+    s.custom = Some(CustomEffect { mode, speed, direction, scale, origin_ms });
+}
+
+/// Свой радужный эффект, который идёт прямо сейчас. None — такого нет или кадры перестали идти.
+pub fn custom_effect() -> Option<CustomEffect> {
+    let s = lock();
+    if !live_fresh(&s) {
+        return None;
+    }
+    s.custom.clone()
 }
 
 /// Сейчас горит встроенный эффект прошивки (не своя раскраска и не живые кадры) — его номер.
@@ -177,11 +239,16 @@ pub fn set_rate(mode: i32, speed: i32, rate: f64) {
     }
     if let Some(e) = s.effect.as_mut() {
         if e.mode == mode && e.speed == speed && (old - rate).abs() > 0.0001 {
-            let now = now_ms();
-            let elapsed = now.saturating_sub(e.since_ms) as f64 * old / rate;
-            e.since_ms = now.saturating_sub(elapsed.round() as u64);
+            e.since_ms = rebased_since(now_ms() as i64, e.since_ms, old, rate);
         }
     }
+}
+
+/// Новое начало отсчёта после смены множителя скорости old → rate: фаза (время × множитель) та же.
+/// При замедлении начало уходит в прошлое — возможно, раньше запуска программы (отрицательное).
+fn rebased_since(now: i64, since: i64, old: f64, rate: f64) -> i64 {
+    let elapsed = (now - since) as f64 * old / rate;
+    now - elapsed.round_ties_even() as i64
 }
 
 /// Сколько «фаз» занимает один круг эффекта в одной точке. None — эффект сам не повторяется.
@@ -219,7 +286,7 @@ pub fn calibrate(seconds: f64, circles: u32) -> Option<f64> {
 /// Начать круг эффекта заново (например, «Спектр» — когда клавиатура сейчас синяя).
 pub fn restart_effect_clock() {
     if let Some(e) = lock().effect.as_mut() {
-        e.since_ms = now_ms();
+        e.since_ms = now_ms() as i64;
     }
 }
 
@@ -330,7 +397,7 @@ fn hue(h: f64) -> Rgb {
 }
 
 fn effect_at(e: &EffectState, rates: &BTreeMap<String, f64>, x: f64, y: f64, seed: f64) -> Rgb {
-    let seconds = now_ms().saturating_sub(e.since_ms) as f64 / 1000.0;
+    let seconds = (now_ms() as i64 - e.since_ms) as f64 / 1000.0;
     effect_at_time(e, rate_for(rates, e.mode, e.speed), seconds, x, y, seed)
 }
 
@@ -407,6 +474,26 @@ mod tests {
     #[test]
     fn spectrum_starts_blue() {
         assert_eq!(effect_at_time(&st(8, 5, false), 1.0, 0.0, 0.3, 0.3, 0.0), (0, 0, 255));
+    }
+
+    #[test]
+    fn slower_rate_keeps_phase() {
+        // 10 с на множителе 1.0 = 20 с на множителе 0.5: начало уходит раньше запуска программы.
+        let since = rebased_since(12_000, 2_000, 1.0, 0.5);
+        assert_eq!(since, -8_000);
+        assert_eq!((12_000 - since) as f64 * 0.5, 10_000.0);
+        // Ускорение — начало ближе к «сейчас».
+        assert_eq!(rebased_since(12_000, 2_000, 1.0, 2.0), 7_000);
+    }
+
+    #[test]
+    fn custom_effect_follows_keyboard_formula() {
+        let c = CustomEffect { mode: crate::effects::FLOW, speed: 3, direction: 0, scale: 1.0, origin_ms: 0 };
+        let k = crate::effects::rainbow_at(crate::effects::FLOW, 0.25, 0.5, Some(0.1), 1.5, 3, 0);
+        assert_eq!(c.at_time(1.5, 0.25, 0.5, 0.1), (from_led(k.0), from_led(k.1), from_led(k.2)));
+        // Яркость клавиатуры 0 — вентиляторы тоже гаснут.
+        let dark = CustomEffect { scale: 0.0, ..c };
+        assert_eq!(dark.at_time(1.5, 0.25, 0.5, 0.1), (0, 0, 0));
     }
 
     #[test]

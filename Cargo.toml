@@ -1,6 +1,6 @@
 [package]
 name = "rigcontrol-core"
-version = "0.38.0"
+version = "0.38.1"
 edition = "2021"
 rust-version = "1.80"
 description = "Порт RigControl (C#) на Rust: протокол AJAZZ AK820 Pro, эффекты подсветки и консольная утилита"

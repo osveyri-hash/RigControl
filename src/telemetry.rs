@@ -63,6 +63,7 @@ pub struct Telemetry {
     disks: Disks,
     components: Components,
     last_net: Instant,
+    last_net_list: Instant,
     last_disk: Instant,
     last_gpu: Option<Instant>,
     gpu_cache: Option<GpuStats>,
@@ -70,6 +71,9 @@ pub struct Telemetry {
     pub overrides: Overrides,
     /// Спрашивать LibreHardwareMonitor (через помощника). По умолчанию — да.
     pub use_lhm: bool,
+    /// Опрашивать и плату: на её чипе мониторинга — Vcore (нужно странице «О системе», как в C#:
+    /// telemetry.Read(sensors, fans || system, system)). Без этого у CPU без SVI показывался бы VID.
+    pub read_board: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -97,6 +101,20 @@ pub fn parse_nvidia_smi(out: &str) -> Option<GpuStats> {
         vram_used_gb: num(parts[3])? / 1024.0,
         vram_total_gb: num(parts[4])? / 1024.0,
     })
+}
+
+/// Том Windows («C:»): как Environment.SystemDirectory в C# — Windows стоит не обязательно на C:.
+fn system_drive() -> String {
+    system_drive_from(std::env::var("SystemDrive").ok().as_deref())
+}
+
+fn system_drive_from(var: Option<&str>) -> String {
+    let d = var.unwrap_or("").trim().to_uppercase();
+    let mut chars = d.chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some(letter), Some(':'), None) if letter.is_ascii_alphabetic() => d,
+        _ => "C:".to_string(),
+    }
 }
 
 fn query_nvidia() -> Option<GpuStats> {
@@ -149,12 +167,14 @@ impl Telemetry {
             disks: Disks::new_with_refreshed_list(),
             components: Components::new_with_refreshed_list(),
             last_net: Instant::now(),
+            last_net_list: Instant::now(),
             last_disk: Instant::now(),
             last_gpu: None,
             gpu_cache: None,
             nvidia_smi: true,
             overrides: Overrides::default(),
             use_lhm: true,
+            read_board: false,
         }
     }
 
@@ -166,7 +186,14 @@ impl Telemetry {
         self.components.refresh();
 
         let elapsed = self.last_net.elapsed().as_secs_f64().max(0.001);
-        self.networks.refresh();
+        // Список адаптеров перечитываем: Wi-Fi или кабель, подключённые после запуска, иначе
+        // не попали бы в счёт (в C# адаптеры перечисляются на каждом чтении).
+        if self.last_net_list.elapsed() >= Duration::from_secs(10) {
+            self.networks.refresh_list();
+            self.last_net_list = Instant::now();
+        } else {
+            self.networks.refresh();
+        }
         self.last_net = Instant::now();
         let (mut down, mut up) = (0u64, 0u64);
         for (_, data) in self.networks.iter() {
@@ -179,9 +206,10 @@ impl Telemetry {
             self.last_disk = Instant::now();
         }
         let (mut disk_pct, mut disk_free) = (0.0, 0.0);
+        let system_drive = system_drive();
         for d in self.disks.iter() {
             let mount = d.mount_point().to_string_lossy().to_uppercase();
-            if mount.starts_with("C:") || (cfg!(not(windows)) && mount == "/") {
+            if mount.starts_with(&system_drive) || (cfg!(not(windows)) && mount == "/") {
                 let total = d.total_space() as f64;
                 let free = d.available_space() as f64;
                 if total > 0.0 {
@@ -203,7 +231,7 @@ impl Telemetry {
         let gpu = self.gpu_cache.clone();
 
         let (hw, sensors_note) = if self.use_lhm {
-            match crate::lhm::read(false) {
+            match crate::lhm::read(self.read_board) {
                 Ok(r) => {
                     let note = crate::lhm::note(&r);
                     (Some(r), note)
@@ -315,6 +343,15 @@ pub fn live() -> Option<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_drive_falls_back_to_c() {
+        assert_eq!(system_drive_from(Some("d:")), "D:");
+        assert_eq!(system_drive_from(Some("C:")), "C:");
+        assert_eq!(system_drive_from(None), "C:");
+        assert_eq!(system_drive_from(Some("")), "C:");
+        assert_eq!(system_drive_from(Some("мусор")), "C:");
+    }
 
     #[test]
     fn nvidia_smi_line() {

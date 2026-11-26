@@ -268,6 +268,8 @@ internal sealed class Sensors : IDisposable
     /// <summary>Скорость вентиляторов: id → % (0–100) или null — вернуть плате (BIOS). Звать после Read с board.</summary>
     public void ApplyFans(IReadOnlyDictionary<string, float?> targets)
     {
+        // Каналы, которые не удалось вернуть плате: вентилятор мог остаться на заданной (низкой) скорости.
+        List<string>? notRestored = null;
         lock (_fanLock)
         {
             foreach (var (id, target) in targets)
@@ -283,17 +285,25 @@ internal sealed class Sensors : IDisposable
                         control.SetSoftware(value);
                         _applied[id] = value;
                     }
-                    else if (_applied.Remove(id))
+                    else if (_applied.ContainsKey(id))
                     {
+                        // Забываем канал только после удачного возврата: иначе следующий запрос «вернуть плате»
+                        // ничего бы не сделал, и RestoreFans при выходе его бы пропустил.
                         control.SetDefault();
+                        _applied.Remove(id);
                     }
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Канал не управляется — пропускаем.
+                    // Канал не управляется — пропускаем. Но о неудачном возврате плате молчать нельзя
+                    // (в C#-версии это _restoreFailed и запись в журнал).
+                    if (target is null) (notRestored ??= new List<string>()).Add($"{id}: {ex.Message}");
                 }
             }
         }
+
+        if (notRestored is not null)
+            throw new IOException("не удалось вернуть вентилятор плате (" + string.Join("; ", notRestored) + ")");
     }
 
     /// <summary>Все каналы, которыми управляли, — обратно плате.</summary>
@@ -307,14 +317,13 @@ internal sealed class Sensors : IDisposable
                 try
                 {
                     if (_controls.TryGetValue(id, out var sensor)) sensor.Control?.SetDefault();
+                    _applied.Remove(id);
                 }
                 catch
                 {
-                    // процесс и так завершается
+                    // Процесс и так завершается; канал остаётся в списке — Dispose попробует ещё раз.
                 }
             }
-
-            _applied.Clear();
         }
         finally
         {

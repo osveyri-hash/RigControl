@@ -262,6 +262,50 @@ fn nap(ms: u64, stop: &AtomicBool) {
     }
 }
 
+/// Профилактическое рукопожатие перед кадром (ReArmBeforeFrameAsync в C#): если кадры надолго
+/// прервались (сон ПК, тяжёлая загрузка картинки) или просто прошло 30 с, прошивка помпы уже могла
+/// показать свой логотип и молча игнорировать кадры — запись в USB при этом проходит без ошибки.
+struct ReArm {
+    last_frame: Option<Instant>,
+    last_rearm: Instant,
+    blocked_until: Option<Instant>,
+}
+
+/// Как часто повторять рукопожатие «на всякий случай» (KeepAliveMs).
+const REARM_KEEP_ALIVE: Duration = Duration::from_secs(30);
+/// Помпа не ответила на профилактическое рукопожатие — столько его не повторяем.
+const REARM_BACKOFF: Duration = Duration::from_secs(300);
+
+impl ReArm {
+    fn new() -> Self {
+        // Помпу только что открыли — рукопожатие уже было.
+        Self { last_frame: None, last_rearm: Instant::now(), blocked_until: None }
+    }
+
+    /// Пора ли повторить рукопожатие перед кадром, который идёт раз в interval_ms.
+    fn due(&self, interval_ms: u64, now: Instant) -> bool {
+        let pause = Duration::from_millis((interval_ms * 2 + 500).max(1500));
+        let after_pause = self.last_frame.is_some_and(|t| now.saturating_duration_since(t) > pause);
+        let blocked = self.blocked_until.is_some_and(|t| now < t);
+        let after_time = !blocked && now.saturating_duration_since(self.last_rearm) > REARM_KEEP_ALIVE;
+        after_pause || after_time
+    }
+
+    fn before_frame(&mut self, lcd: &mut cooler::CoolerLcd, interval_ms: u64) {
+        let now = Instant::now();
+        if !self.due(interval_ms, now) {
+            return;
+        }
+        self.last_rearm = now;
+        // Не ответила: занята или другая прошивка. Кадры шлём дальше, профилактику откладываем.
+        self.blocked_until = if lcd.rearm(250) { None } else { Some(now + REARM_BACKOFF) };
+    }
+
+    fn sent(&mut self) {
+        self.last_frame = Some(Instant::now());
+    }
+}
+
 /// Как часто опрашивать датчики для экрана помпы.
 pub const SENSOR_PERIOD: Duration = Duration::from_millis(1000);
 
@@ -305,13 +349,16 @@ fn pump_loop(s: &Settings, stop: &AtomicBool, st: &Status) -> Result<(), String>
             let name = Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string());
             set_status(st, "Помпа", format!("{} · картинка {name} ({} кадр.)", lcd.description(), frames.len()));
             let mut i = 0usize;
+            let mut rearm = ReArm::new();
             while !stop.load(Ordering::Relaxed) {
                 let tick = Instant::now();
                 let f = &frames[i % frames.len()];
-                lcd.send_image(&f.image)?;
-                count(&lcd, &mut sent);
                 // Одиночную картинку повторяем дважды в секунду — иначе помпа уходит на логотип.
                 let delay = if frames.len() == 1 { 500 } else { (f.delay_ms as u64).max(20) };
+                rearm.before_frame(&mut lcd, delay);
+                lcd.send_image(&f.image)?;
+                rearm.sent();
+                count(&lcd, &mut sent);
                 nap(delay.saturating_sub(tick.elapsed().as_millis() as u64), stop);
                 i += 1;
             }
@@ -356,6 +403,7 @@ fn pump_loop(s: &Settings, stop: &AtomicBool, st: &Status) -> Result<(), String>
     let mut last_sig = String::new();
     let mut last_frame: Option<image::RgbImage> = None;
     let mut last_sent = Instant::now() - Duration::from_secs(1);
+    let mut rearm = ReArm::new();
     while !stop.load(Ordering::Relaxed) {
         let tick = Instant::now();
         // Датчики — раз в секунду (LibreHardwareMonitor тяжёлый, чаще смысла нет); частота кадров на это не влияет.
@@ -390,13 +438,17 @@ fn pump_loop(s: &Settings, stop: &AtomicBool, st: &Status) -> Result<(), String>
             last_frame = Some(rotate(lcdscene::render(w, h, &items, &snap, &now, background, k, &mut fonts), rot));
             last_sig = sig;
             if let Some(f) = &last_frame {
+                rearm.before_frame(&mut lcd, 500);
                 lcd.send_image(f)?;
+                rearm.sent();
                 count(&lcd, &mut sent);
                 last_sent = Instant::now();
             }
         } else if last_sent.elapsed() >= Duration::from_millis(500) {
             if let Some(f) = &last_frame {
+                rearm.before_frame(&mut lcd, 500);
                 lcd.send_image(f)?;
+                rearm.sent();
                 count(&lcd, &mut sent);
                 last_sent = Instant::now();
             }
@@ -434,6 +486,25 @@ pub fn reset_pump_usb() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rearm_after_pause_or_keep_alive() {
+        let t0 = Instant::now();
+        let mut r = ReArm { last_frame: Some(t0), last_rearm: t0, blocked_until: None };
+        // Кадры идут ровно — рукопожатие не нужно.
+        assert!(!r.due(500, t0 + Duration::from_millis(600)));
+        // Пауза дольше max(1500, 2·интервал + 500) мс (сон ПК) — нужно.
+        assert!(r.due(500, t0 + Duration::from_millis(1600)));
+        assert!(!r.due(2000, t0 + Duration::from_millis(4000)));
+        assert!(r.due(2000, t0 + Duration::from_millis(4600)));
+        // Раз в 30 с — на всякий случай, но не пока помпа «не отвечает на профилактику».
+        r.last_frame = Some(t0 + Duration::from_secs(31));
+        assert!(r.due(500, t0 + Duration::from_secs(31)));
+        r.blocked_until = Some(t0 + Duration::from_secs(300));
+        assert!(!r.due(500, t0 + Duration::from_secs(31)));
+        // Первый кадр после открытия: рукопожатие только что было.
+        assert!(!ReArm::new().due(500, Instant::now()));
+    }
 
     #[test]
     fn argb_modes_match_csharp_numbers() {

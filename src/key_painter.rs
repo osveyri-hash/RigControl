@@ -185,14 +185,6 @@ impl KeyPainter {
         } else {
             self.last = None;
         }
-        // ПКМ — пипетка.
-        if resp.secondary_clicked() {
-            if let Some(k) = hovered {
-                if let Some(h) = self.paint.get(&k.code.to_string()).cloned() {
-                    self.set_brush(rgb(&h), s);
-                }
-            }
-        }
         if changed {
             self.store(s);
         }
@@ -203,6 +195,20 @@ impl KeyPainter {
         let shown = if mirror_shown { crate::light_mirror::display() } else { None };
         if mirror {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
+        // ПКМ — пипетка: цвет клавиши в кисть; если на схеме подсветка — тот, что горит (OnPaintPick в C#).
+        if resp.secondary_clicked() {
+            if let Some(k) = hovered {
+                let glowing = shown
+                    .as_ref()
+                    .and_then(|(bank, _)| crate::light_mirror::bank_color(bank, k.code))
+                    .map(|(r, g, b)| [r, g, b])
+                    .filter(|c| u32::from(c[0]) + u32::from(c[1]) + u32::from(c[2]) > 24);
+                let picked = glowing.or_else(|| self.paint.get(&k.code.to_string()).map(|h| rgb(h)));
+                if let Some(c) = picked {
+                    self.set_brush(c, s);
+                }
+            }
         }
 
         for k in KEYS {

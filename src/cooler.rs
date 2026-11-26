@@ -198,6 +198,15 @@ impl CoolerLcd {
         true
     }
 
+    /// Повторное рукопожатие перед кадром (Reinit в C#): помпа, показавшая свой логотип после паузы
+    /// или сна, без него кадры не принимает. Размер экрана не трогаем — он мог быть выбран вручную.
+    pub fn rearm(&mut self, timeout_ms: i32) -> bool {
+        let resolution = self.resolution;
+        let ok = self.handshake(timeout_ms);
+        self.resolution = resolution;
+        ok
+    }
+
     /// Шлёт кадр порциями. При сбое один раз повторяет рукопожатие и кадр целиком.
     fn write_frame(&mut self, padded: &[u8]) -> Result<(), String> {
         for attempt in 0..2 {
@@ -320,19 +329,19 @@ pub fn load_bytes(bytes: &[u8], gif: bool, width: u32, height: u32, rotation: u3
     let (draw_w, draw_h) = if swap { (height, width) } else { (width, height) };
     if gif {
         let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| format!("GIF: {e}"))?;
-        let frames = decoder.into_frames().collect_frames().map_err(|e| format!("GIF: {e}"))?;
+        // Кадры берём по одному и сразу ужимаем под экран: collect_frames() держал бы всю гифку
+        // в исходном размере (1000 кадров 1920×1080 — около 8 ГБ) ещё до ограничения MAX_FRAMES.
+        let mut frames = Vec::new();
+        for f in decoder.into_frames().take(MAX_FRAMES) {
+            let f = f.map_err(|e| format!("GIF: {e}"))?;
+            let delay = gif_delay_ms(f.delay());
+            let img = DynamicImage::ImageRgba8(f.into_buffer());
+            frames.push(LcdFrame { image: rotate(compose(&img, draw_w, draw_h, crop), rotation), delay_ms: delay.max(20) });
+        }
         if frames.is_empty() {
             return Err("В файле нет ни одного кадра".into());
         }
-        return Ok(frames
-            .into_iter()
-            .take(MAX_FRAMES)
-            .map(|f| {
-                let delay = gif_delay_ms(f.delay());
-                let img = DynamicImage::ImageRgba8(f.into_buffer());
-                LcdFrame { image: rotate(compose(&img, draw_w, draw_h, crop), rotation), delay_ms: delay.max(20) }
-            })
-            .collect());
+        return Ok(frames);
     }
     let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
     Ok(vec![LcdFrame { image: rotate(compose(&img, draw_w, draw_h, crop), rotation), delay_ms: 1000 }])

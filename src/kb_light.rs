@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use crate::gif_light::{self, GifLight};
 use crate::keyboard::{self, Keyboard};
 use crate::protocol::{self, ScreenFrame};
+use crate::screen_upload::{self, ScreenUpload, UploadState};
 use crate::settings::Settings;
 use crate::{effects, keypaint, screen, timing, Rgb};
 
@@ -58,6 +59,8 @@ enum Cmd {
     Light(bool),
     Time,
     Reconnect,
+    /// Залить кадры на экранчик (только по кабелю); ход и итог — в ScreenUpload.
+    Upload(Vec<ScreenFrame>, ScreenUpload),
 }
 
 pub struct KbLight {
@@ -109,6 +112,16 @@ impl KbLight {
         let _ = self.tx.send(Cmd::Reconnect);
     }
 
+    /// «Отправить на экран»: заливку делает этот же поток, между пакетами подсветки (OnUpload в C#:
+    /// подсветка в такт останавливается, после заливки запускается снова).
+    pub fn upload(&self, frames: Vec<ScreenFrame>) -> ScreenUpload {
+        let up = ScreenUpload::queued();
+        if self.tx.send(Cmd::Upload(frames, up.clone())).is_err() {
+            up.set(UploadState::Failed("поток клавиатуры не работает".into()));
+        }
+        up
+    }
+
     pub fn state(&self) -> KbState {
         lock(&self.shared).clone()
     }
@@ -134,7 +147,7 @@ impl Drop for KbLight {
 }
 
 /// Кабель AK820 Pro (интерфейс команд 0xFF13) сейчас подключён.
-fn cable_present() -> bool {
+pub(crate) fn cable_present() -> bool {
     hidapi::HidApi::new()
         .map(|api| {
             api.device_list().any(|i| {
@@ -470,6 +483,7 @@ impl Worker {
                     }
                 }
                 Some(Cmd::Time) => self.sync_time(),
+                Some(Cmd::Upload(frames, up)) => self.upload(&frames, &up),
                 Some(Cmd::Reconnect) => {
                     self.kb = None;
                     self.run = None;
@@ -631,6 +645,8 @@ impl Worker {
             if matches!(mode, 6 | 8) {
                 *note = Some("«Разноцветный» и «Спектр» в прошивке всегда радужные — цвет гифки к ним не применяется.".into());
             }
+            // Пакеты «в такт гифке» переписывают сохранённый эффект: что там теперь — уже не знаем.
+            self.saved = None;
             self.run = Some(Run::Sync(Box::new(SyncColor::new(s, &self.frames, wired))));
             return Ok(());
         }
@@ -699,6 +715,35 @@ impl Worker {
         }
     }
 
+    /// Заливка экранчика: кадры подсветки на это время стоят, потом подсветка выставляется заново.
+    fn upload(&mut self, frames: &[ScreenFrame], up: &ScreenUpload) {
+        self.run = None;
+        // Открыта по радио — пробуем заново: кабель мог появиться после последней проверки.
+        if self.kb.as_ref().is_some_and(Keyboard::via_dongle) {
+            self.kb = None;
+        }
+        const CABLE_ONLY: &str = "Картинки на экран заливаются только по кабелю USB-C.";
+        let result = if !self.ensure_open() {
+            let why = match &lock(&self.shared).link {
+                Some(Err(e)) => e.clone(),
+                _ => "клавиатура не найдена".into(),
+            };
+            Err(format!("{why}\n{CABLE_ONLY}"))
+        } else {
+            match self.kb.as_mut().and_then(Keyboard::wired_mut) {
+                Some(dev) => screen_upload::send(dev, frames, up),
+                None => Err(CABLE_ONLY.into()),
+            }
+        };
+        up.set(match result {
+            Ok(m) => UploadState::Done(m),
+            Err(e) => UploadState::Failed(e),
+        });
+        if !self.off {
+            self.apply();
+        }
+    }
+
     fn sync_time(&mut self) {
         if !self.ensure_open() {
             self.event("Часы: клавиатура не найдена.".into());
@@ -727,7 +772,21 @@ impl Worker {
 
     fn frame(&mut self) {
         let (Some(s), Some(Run::Live(live))) = (self.cfg.as_ref(), self.run.as_mut()) else { return };
-        let bank = live_bank(s, &live.src, live.start.elapsed().as_secs_f64());
+        let t = live.start.elapsed().as_secs_f64();
+        // Вентиляторы «как клавиатура» посчитают свой радужный эффект у себя, в такт (LightMirror.Custom);
+        // раскраска, гифка по клавишам и остальные эффекты — «не такой»: там берутся цвета клавиш из кадра.
+        let mode = protocol::effect_mode(s.effect);
+        match &live.src {
+            Source::Effect { .. } if mode != effects::PAINT => crate::light_mirror::custom(
+                mode,
+                s.speed.clamp(0, 5),
+                s.direction,
+                f64::from(s.brightness.clamp(0, 5)) / 5.0,
+                t,
+            ),
+            _ => crate::light_mirror::custom(0, 0, 0, 1.0, 0.0),
+        }
+        let bank = live_bank(s, &live.src, t);
         let frame = protocol::live_frame(&bank);
         let sent = match self.kb.as_mut().and_then(|k| k.wired_mut()) {
             Some(dev) => dev.send_live_frame(&frame),

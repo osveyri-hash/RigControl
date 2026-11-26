@@ -23,11 +23,15 @@ tasklist /FI "IMAGENAME eq rigcontrol-service.exe" 2>nul | find /I "rigcontrol-s
   echo Останавливаю фоновую службу…
   target\release\rigcontrol-service.exe --quit
 )
+rem Ждём, пока выйдут и помощник датчиков, и сама служба: она отвечает на --quit раньше, чем завершается,
+rem а пока её exe занят, copy заменил бы только часть файлов (окно новое, служба старая).
 for /l %%i in (1,1,20) do (
-  tasklist /FI "IMAGENAME eq rigcontrol-sensors.exe" 2>nul | find /I "rigcontrol-sensors.exe" >nul || goto :copy
+  tasklist /FI "IMAGENAME eq rigcontrol-sensors.exe" 2>nul | find /I "rigcontrol-sensors.exe" >nul || (
+    tasklist /FI "IMAGENAME eq rigcontrol-service.exe" 2>nul | find /I "rigcontrol-service.exe" >nul || goto :copy
+  )
   timeout /t 1 /nobreak >nul
 )
-echo Ещё работает помощник датчиков: закройте RigControl и подождите пару секунд.
+echo Ещё работает фоновая служба или помощник датчиков: закройте RigControl (значок в трее - «Выход») и подождите пару секунд.
 pause & exit /b 1
 
 :copy

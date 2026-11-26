@@ -402,11 +402,16 @@ impl MousePanel {
         f: impl FnOnce(&McMouse, &MouseConfig) -> Result<(), String> + Send + 'static,
     ) {
         let Some(cfg) = self.cfg.clone() else { return };
-        self.run(ctx, what, move |m| f(m, &cfg));
+        self.run(ctx, what, move |m| f(m, &fresh_config(m, cfg.profile)?));
     }
 
     fn busy(&self) -> bool {
         self.op_rx.is_some() || self.load_rx.is_some()
+    }
+
+    /// Профиль, настройки которого сейчас на странице.
+    fn shown_profile(&self) -> Option<u8> {
+        self.cfg.as_ref().map(|c| c.profile)
     }
 
     /// Итог фоновой записи: ошибка — сообщением, настройки — на страницу.
@@ -434,7 +439,8 @@ impl MousePanel {
         let onoff = |b: bool| if b { 1u8 } else { 2u8 };
         let (lod, rip, ang, mot, mode, rot) =
             (self.lod, onoff(self.ripple), onoff(self.angle), onoff(self.motion), self.mode + 1, self.rotate);
-        self.run(ctx, "", move |m| m.write_sensor(lod, rip, ang, mot, mode, Some(rot)));
+        // Все поля сенсора пишутся разом — с этой страницы, то есть из показанного профиля.
+        self.run_cfg(ctx, "", move |m, _| m.write_sensor(lod, rip, ang, mot, mode, Some(rot)));
     }
 
     fn write_dpi(&mut self, ctx: &egui::Context) {
@@ -450,11 +456,22 @@ impl MousePanel {
     fn assign(&mut self, ctx: &egui::Context, b: usize, key: MouseKey) -> Option<String> {
         let key = mousekeys::normalize(b, key);
         // Защита из MainWindow.MouseKeys.cs: нельзя остаться без левого клика.
-        let any_left = (0..mousekeys::COUNT).any(|i| mousekeys::is_left_click(i, if i == b { key } else { self.keys[i] }));
+        let any_left = keeps_left_click(&self.keys, b, key);
         if !any_left {
             return Some("Мышь: после этого ни одна кнопка не будет левым кликом — не записываю.".into());
         }
-        self.run(ctx, "", move |m| m.write_key(b as u8, key));
+        let Some(profile) = self.shown_profile() else {
+            return Some("Мышь: настройки ещё не прочитаны — кнопка не записана.".into());
+        };
+        self.run(ctx, "", move |m| {
+            // Проверку повторяем по настройкам, прочитанным прямо перед записью: страница могла показывать
+            // другой профиль (его переключают и кнопкой на самой мыши), а в нём левый клик — на другой кнопке.
+            let fresh = fresh_config(m, profile)?;
+            if !keeps_left_click(&fresh.keys, b, key) {
+                return Err("после этого ни одна кнопка не будет левым кликом — не записываю".into());
+            }
+            m.write_key(b as u8, key)
+        });
         None
     }
 
@@ -796,6 +813,8 @@ impl MousePanel {
             ui.add_space(8.0);
             for n in 1..=6usize {
                 if segment(ui, self.dpi_count == n, &n.to_string(), true).clicked() && self.dpi_count != n {
+                    // В неиспользуемых ячейках мыши может лежать 0: включённый уровень стал бы 50 DPI.
+                    fill_new_levels(&mut self.dpi_x, &mut self.dpi_y, self.dpi_count, n, self.max_dpi);
                     self.dpi_count = n;
                     self.level = self.level.min(n - 1);
                     write = true;
@@ -810,9 +829,12 @@ impl MousePanel {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("↺ Сброс").on_hover_text("Уровни как с завода: 400, 800, 1600, 3200, 6400 и максимум").clicked() {
-                    let max = self.max_dpi;
-                    self.dpi_x = [400, 800, 1600, 3200, 6400, max];
+                    // Как с завода (OnMouseDpiReset в C#): шесть уровней, текущий — третий (1600), X = Y.
+                    self.dpi_x = default_dpi(self.max_dpi);
                     self.dpi_y = self.dpi_x;
+                    self.dpi_count = 6;
+                    self.level = 2;
+                    self.dpi_separate = false;
                     write = true;
                 }
             });
@@ -1341,9 +1363,80 @@ fn battery_text(st: Option<&MouseStatus>) -> String {
         .unwrap_or_default()
 }
 
+/// Заводские уровни DPI (DefaultDpi в C#): последний — предел сенсора.
+fn default_dpi(max: u16) -> [u16; 6] {
+    [400, 800, 1600, 3200, 6400, max]
+}
+
+/// Увеличили число уровней с old до new: негодные значения в новых ячейках (вне 200…50000) заменить
+/// заводскими (OnMouseDpiCount в C#).
+fn fill_new_levels(x: &mut [u16; 6], y: &mut [u16; 6], old: usize, new: usize, max: u16) {
+    let defaults = default_dpi(max);
+    for i in old.min(6)..new.min(6) {
+        if !(200..=50000).contains(&x[i]) {
+            x[i] = defaults[i];
+        }
+        if !(200..=50000).contains(&y[i]) {
+            y[i] = x[i];
+        }
+    }
+}
+
+/// Останется ли левый клик хоть на одной кнопке, если кнопке b назначить key.
+fn keeps_left_click(keys: &[MouseKey], b: usize, key: MouseKey) -> bool {
+    (0..mousekeys::COUNT).any(|i| mousekeys::is_left_click(i, if i == b { key } else { keys[i] }))
+}
+
+/// Настройки, прочитанные прямо перед записью. Ошибка — если не прочитались или мышь уже на другом
+/// профиле, чем показан на странице: иначе уровни DPI и кнопки одного профиля записались бы в другой.
+fn fresh_config(m: &McMouse, shown_profile: u8) -> Result<MouseConfig, String> {
+    let fresh = m
+        .read_config()
+        .filter(|c| c.valid)
+        .ok_or("не удалось прочитать текущий профиль мыши — ничего не записано")?;
+    if fresh.profile != shown_profile {
+        return Err(format!(
+            "на мыши включён профиль {}, а страница показывала профиль {} — настройки перечитаны, повторите",
+            fresh.profile + 1,
+            shown_profile + 1
+        ));
+    }
+    Ok(fresh)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_dpi_levels_get_factory_values() {
+        // Один рабочий уровень, в остальных ячейках мыши — нули.
+        let (mut x, mut y) = ([1600, 0, 0, 0, 0, 0], [1600, 0, 0, 0, 0, 0]);
+        fill_new_levels(&mut x, &mut y, 1, 3, 26000);
+        assert_eq!(x, [1600, 800, 1600, 0, 0, 0]);
+        assert_eq!(y, [1600, 800, 1600, 0, 0, 0]);
+        // Годные значения не трогаем; предел сенсора — у шестого уровня.
+        let (mut x, mut y) = ([400, 1000, 0, 0, 0, 0], [400, 900, 0, 0, 0, 0]);
+        fill_new_levels(&mut x, &mut y, 1, 6, 26000);
+        assert_eq!(x, [400, 1000, 1600, 3200, 6400, 26000]);
+        assert_eq!(y, [400, 900, 1600, 3200, 6400, 26000]);
+    }
+
+    #[test]
+    fn left_click_guard_uses_given_keys() {
+        // Родные функции (тип 0) на всех кнопках: левый клик — только на левой.
+        let keys = [MouseKey::default(); mousekeys::COUNT];
+        let other = mousekeys::keyboard_key(0, 4);
+        assert!(keeps_left_click(&keys, mousekeys::LEFT + 1, other));
+        assert!(!keeps_left_click(&keys, mousekeys::LEFT, other));
+        // В другом профиле левая кнопка уже занята клавишей, а левый клик висит на последней кнопке:
+        // её переназначать нельзя — проверять надо по настройкам этого профиля, а не показанного.
+        let mut second = keys;
+        second[mousekeys::LEFT] = other;
+        second[mousekeys::COUNT - 1] = MouseKey { kind: 1, value: 0x01_0000 }; // «левый клик»
+        assert!(keeps_left_click(&keys, mousekeys::COUNT - 1, other));
+        assert!(!keeps_left_click(&second, mousekeys::COUNT - 1, other));
+    }
 
     #[test]
     fn dpi_scale_round_trip() {

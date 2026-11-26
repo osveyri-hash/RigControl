@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use rigcontrol_core::host::Devices;
 use rigcontrol_core::memory;
 use rigcontrol_core::service_link::{self, Request};
+use rigcontrol_core::single_instance;
 
 fn main() {
     if std::env::args().any(|a| a == "--quit") {
@@ -39,7 +40,10 @@ fn main() {
 
 /// Поток устройств: запускает их, отдаёт окну на время паузы, останавливает при выходе.
 fn control(rx: Receiver<Request>, tip: Arc<Mutex<String>>, ui_thread: u32) {
-    let mut devices = Some(Devices::start());
+    // Окно уже открыто (служба стартовала позже него — например, автозапуск с задержкой 10 с, а окно
+    // открыли сразу после входа): устройства ведёт оно, и паузу оно уже не попросит. Не запускаем свои
+    // потоки рядом с его потоками, а ждём, пока окно закроется.
+    let mut devices = (!single_instance::window_running()).then(Devices::start);
     let mut paused = 0usize;
     let mut trim_at = Instant::now() + Duration::from_secs(20);
     loop {
@@ -53,7 +57,7 @@ fn control(rx: Receiver<Request>, tip: Arc<Mutex<String>>, ui_thread: u32) {
             }
             Ok(Request::Resume) => {
                 paused = paused.saturating_sub(1);
-                if paused == 0 && devices.is_none() {
+                if paused == 0 && devices.is_none() && !single_instance::window_running() {
                     devices = Some(Devices::start());
                     trim_at = Instant::now() + Duration::from_secs(15);
                 }
@@ -68,7 +72,13 @@ fn control(rx: Receiver<Request>, tip: Arc<Mutex<String>>, ui_thread: u32) {
                 tray::quit(ui_thread);
                 return;
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                // Паузы нет, но устройства не наши — их вело окно, открытое до запуска службы. Закрылось — берём.
+                if paused == 0 && devices.is_none() && !single_instance::window_running() {
+                    devices = Some(Devices::start());
+                    trim_at = Instant::now() + Duration::from_secs(15);
+                }
+            }
             Err(RecvTimeoutError::Disconnected) => {
                 if let Some(d) = devices.take() {
                     d.stop();
@@ -108,6 +118,7 @@ fn logo_rgba(size: u32) -> Option<Vec<u8>> {
 #[cfg(windows)]
 mod tray {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// MSG из WinUser.h (48 байт на x64).
     #[repr(C)]
@@ -144,7 +155,13 @@ mod tray {
         unsafe { GetCurrentThreadId() }
     }
 
+    /// Пора выходить. Сообщение потоку может потеряться: пока открыто меню значка, сообщения потока
+    /// (без окна) забирает и выбрасывает модальный цикл меню. Поэтому выход ещё и помечается флагом,
+    /// а цикл проверяет его на каждом сообщении — в том числе по таймеру раз в 2 с.
+    static QUIT: AtomicBool = AtomicBool::new(false);
+
     pub fn quit(thread: u32) {
+        QUIT.store(true, Ordering::SeqCst);
         unsafe {
             PostThreadMessageW(thread, WM_APP_QUIT, 0, 0);
         }
@@ -187,7 +204,7 @@ mod tray {
             if unsafe { GetMessageW(&mut msg, 0, 0, 0) } <= 0 {
                 break;
             }
-            if msg.hwnd == 0 && msg.message == WM_APP_QUIT {
+            if QUIT.load(Ordering::SeqCst) || (msg.hwnd == 0 && msg.message == WM_APP_QUIT) {
                 break;
             }
             if msg.hwnd == 0 && msg.message == WM_TIMER {

@@ -206,6 +206,12 @@ struct App {
     armoury_rx: Option<std::sync::mpsc::Receiver<bool>>,
     armoury_op: Option<std::sync::mpsc::Receiver<(bool, Result<(), String>)>>,
     armoury_confirm: bool,
+    /// Идёт перезапуск службы (остановка старой и запуск новой) в фоновом потоке.
+    svc_job: Option<std::thread::JoinHandle<Service>>,
+    /// Пока шёл перезапуск, настройки поменялись ещё раз (значение — выставить ли клавиатуру).
+    svc_again: Option<bool>,
+    /// Состояние службы на момент начала перезапуска.
+    svc_last: Vec<(String, String)>,
     /// Помпа: вывод остановлен кнопкой (или автовывод при запуске выключен).
     pump_off: bool,
     pump_diag: bool,
@@ -289,6 +295,9 @@ impl App {
             armoury_rx: None,
             armoury_op: None,
             armoury_confirm: false,
+            svc_job: None,
+            svc_again: None,
+            svc_last: Vec::new(),
             pump_off,
             pump_diag: false,
             pump_reset: None,
@@ -303,10 +312,12 @@ impl App {
 
     fn refresh_autostart(&mut self) {
         // Старая задача запускала окно с --tray: теперь при входе в Windows запускается фоновая служба.
-        if autostart::status() == autostart::Status::Legacy {
+        let mut status = autostart::status();
+        if status == autostart::Status::Legacy {
             let _ = autostart::set(true, "");
+            status = autostart::status();
         }
-        match autostart::status() {
+        match status {
             autostart::Status::Off => (self.autostart_on, self.autostart_other) = (false, None),
             autostart::Status::This | autostart::Status::Legacy => (self.autostart_on, self.autostart_other) = (true, None),
             autostart::Status::Other(cmd) => (self.autostart_on, self.autostart_other) = (false, Some(cmd)),
@@ -437,7 +448,9 @@ impl App {
         rest.fan_modes = self.s.fan_modes.clone();
         rest.fan_percent = self.s.fan_percent.clone();
         rest.fan_curves = self.s.fan_curves.clone();
-        let svc_changed = rest != self.s;
+        // «Обрезать под экран» — общий флажок с экранчиком клавиатуры, но в режиме «Картинка или гифка»
+        // он меняет и кадры помпы: служба читает настройки только при запуске.
+        let svc_changed = rest != self.s || (self.s.cooler_mode == 1 && applied.crop != self.s.crop);
 
         if let Err(e) = self.s.save() {
             self.msg = format!("Не удалось сохранить: {e}");
@@ -452,16 +465,71 @@ impl App {
         self.applied = Some(self.s.clone());
     }
 
+    /// Перезапустить потоки ARGB и помпы с текущими настройками. Остановка ждёт потоки (обмен по USB,
+    /// рукопожатие помпы до 1,5 с, чтение гифки), поэтому идёт в фоне: окно не замирает на каждой правке
+    /// (в C# остановка тоже ожидается асинхронно). Новая служба стартует только после остановки старой.
     fn restart(&mut self, keyboard: bool) {
-        if let Some(s) = self.svc.take() {
-            s.stop();
+        if self.svc_job.is_some() {
+            // Прошлый перезапуск ещё идёт: когда закончится — ещё один, уже с самыми свежими настройками.
+            self.svc_again = Some(self.svc_again.unwrap_or(false) || keyboard);
+            return;
+        }
+        let old = self.svc.take();
+        if let Some(o) = &old {
+            self.svc_last = o.status();
         }
         // Кнопка «Остановить» на странице помпы: служба без вывода на экран.
-        self.svc = Some(Service::start_with(&self.s, keyboard, !self.pump_off));
+        let (s, pump) = (self.s.clone(), !self.pump_off);
+        let job = std::thread::Builder::new().name("svc-restart".into()).spawn(move || {
+            if let Some(o) = old {
+                o.stop();
+            }
+            Service::start_with(&s, keyboard, pump)
+        });
+        match job {
+            Ok(j) => self.svc_job = Some(j),
+            // Поток не создался (старая служба при этом уже получила «стоп»): запускаем здесь.
+            Err(_) => self.svc = Some(Service::start_with(&self.s, keyboard, !self.pump_off)),
+        }
+    }
+
+    /// Раз в кадр: перезапуск закончился — берём новую службу; за это время настройки меняли ещё — повторяем.
+    fn poll_restart(&mut self, ctx: &egui::Context) {
+        if self.svc_job.as_ref().is_some_and(|j| j.is_finished()) {
+            if let Some(j) = self.svc_job.take() {
+                self.svc = j.join().ok();
+            }
+            if let Some(keyboard) = self.svc_again.take() {
+                self.restart(keyboard);
+            }
+        }
+        if self.svc_job.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
+    /// Остановить службу и дождаться этого (закрытие окна, «Сбросить USB экрана»).
+    fn stop_service(&mut self) {
+        self.svc_again = None;
+        if let Some(j) = self.svc_job.take() {
+            if let Ok(s) = j.join() {
+                self.svc = Some(s);
+            }
+        }
+        if let Some(s) = self.svc.take() {
+            self.svc_last = s.status();
+            s.stop();
+        }
     }
 
     fn svc_status(&self, part: &str) -> Option<String> {
-        self.svc.as_ref()?.status().into_iter().find(|x| x.0 == part).map(|x| x.1)
+        // Пока идёт перезапуск — последнее известное состояние, чтобы строки не мигали.
+        let status = match &self.svc {
+            Some(s) => s.status(),
+            None if self.svc_job.is_some() => self.svc_last.clone(),
+            None => return None,
+        };
+        status.into_iter().find(|x| x.0 == part).map(|x| x.1)
     }
 
     /// Плитки главной (UpdateDeviceTiles в MainWindow.Devices.cs).
@@ -1069,7 +1137,7 @@ impl App {
         ui.add_space(12.0);
         if ui.add_enabled(!busy, egui::Button::new("Выбрать картинку или гифку…").min_size(egui::vec2(w, 34.0))).clicked() {
             if let Some(p) = rfd::FileDialog::new()
-                .add_filter("Картинки и гифки", &["png", "jpg", "jpeg", "gif", "bmp", "webp"])
+                .add_filter("Картинки и гифки", &["png", "jpg", "jpeg", "gif", "bmp"])
                 .pick_file()
             {
                 self.scr_path = p.display().to_string();
@@ -1131,7 +1199,7 @@ impl App {
             .min_size(egui::vec2(w, 40.0));
         if ui.add_enabled(can_upload, upload).clicked() {
             self.scr_reported = false;
-            self.scr_upload = Some(ScreenUpload::start(self.scr_frames.clone()));
+            self.scr_upload = Some(self.kb.upload(self.scr_frames.clone()));
         }
         ui.add_space(8.0);
         if ui.add_enabled(!busy && ks.connected(), egui::Button::new("Синхронизировать часы").min_size(egui::vec2(w, 34.0))).clicked() {
@@ -1620,9 +1688,7 @@ impl App {
                             .on_hover_text("Удалить устройство экрана и пересканировать USB, чтобы Windows подняла его заново (как в C#-версии). Помогает, когда помпа зависла на логотипе.")
                             .clicked()
                         {
-                            if let Some(s) = self.svc.take() {
-                                s.stop();
-                            }
+                            self.stop_service();
                             let (tx, rx) = std::sync::mpsc::channel();
                             std::thread::spawn(move || {
                                 let _ = tx.send(rigcontrol_core::service::reset_pump_usb());
@@ -1710,7 +1776,7 @@ impl App {
         ui.horizontal(|ui| {
             if ui.button("Выбрать картинку или гифку…").clicked() {
                 if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("Картинки и гифки", &["png", "jpg", "jpeg", "gif", "bmp", "webp"])
+                    .add_filter("Картинки и гифки", &["png", "jpg", "jpeg", "gif", "bmp"])
                     .pick_file()
                 {
                     self.s.cooler_image = Some(p.display().to_string());
@@ -1725,9 +1791,17 @@ impl App {
             ui.label(muted_text("Выберите картинку или гифку — она будет показываться на помпе вместо сцены."));
             return;
         }
-        let key = format!("{path}|{}", self.s.crop);
+        // Кадр готовим под тот же экран, что и служба: размер, выбранный вручную (иначе 320×240),
+        // при повороте на 90°/270° — вертикальный. Показываем «как видно на помпе», без поворота под панель.
+        let (pw, ph) = rigcontrol_core::service::PUMP_SIZES
+            .get(self.s.cooler_size.max(0) as usize)
+            .copied()
+            .filter(|p| p.0 > 0)
+            .unwrap_or((320, 240));
+        let (pw, ph) = if matches!(self.s.cooler_rotation, 90 | 270) { (ph, pw) } else { (pw, ph) };
+        let key = format!("{path}|{}|{pw}x{ph}", self.s.crop);
         if self.pump_preview.as_ref().map(|p| p.0 != key).unwrap_or(true) {
-            let frames = cooler::load_image(std::path::Path::new(&path), 320, 240, 0, self.s.crop).unwrap_or_default();
+            let frames = cooler::load_image(std::path::Path::new(&path), pw, ph, 0, self.s.crop).unwrap_or_default();
             let ctx = ui.ctx().clone();
             let tex: Vec<(egui::TextureHandle, u64)> = frames
                 .iter()
@@ -1758,8 +1832,10 @@ impl App {
             }
             ui.ctx().request_repaint_after(Duration::from_millis(30));
         }
-        let w = ui.available_width().min(640.0);
-        let size = egui::vec2(w, w * 0.75);
+        let [tw, th] = tex[idx].0.size();
+        let aspect = th.max(1) as f32 / tw.max(1) as f32;
+        let w = ui.available_width().min(640.0).min(480.0 / aspect);
+        let size = egui::vec2(w, w * aspect);
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
         egui::Image::from_texture(egui::load::SizedTexture::from_handle(&tex[idx].0)).rounding(10.0).paint_at(ui, rect);
         ui.add_space(6.0);
@@ -1848,6 +1924,7 @@ impl App {
         ui.label(egui::RichText::new(name).color(theme::TEXT));
         ui.add_space(6.0);
         let theme_now = self.s.cooler_theme.as_deref().and_then(lcdscene::find_theme).unwrap_or_else(lcdscene::default_theme);
+        let mut clear_image = false;
         ui.horizontal(|ui| {
             for (n, label) in [(0, "Верх"), (1, "Низ")] {
                 let field = if n == 0 { &mut self.s.cooler_bg_top } else { &mut self.s.cooler_bg_bottom };
@@ -1859,15 +1936,20 @@ impl App {
                 ui.label(muted_text(label));
                 if rigcontrol_core::color_wheel::wheel_button(ui, ("pump_bg", n), &mut rgb3) {
                     *field = Some(hex(rgb3));
+                    // Цвета градиента видны только без картинки: выбор цвета её убирает (как в C#).
+                    clear_image = true;
                 }
                 ui.add_space(10.0);
             }
         });
+        if clear_image {
+            self.s.cooler_background = None;
+        }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.button("Выбрать картинку…").clicked() {
                 if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("Картинки и гифки", &["png", "jpg", "jpeg", "gif", "bmp", "webp"])
+                    .add_filter("Картинки и гифки", &["png", "jpg", "jpeg", "gif", "bmp"])
                     .pick_file()
                 {
                     self.s.cooler_background = Some(p.display().to_string());
@@ -1883,7 +1965,7 @@ impl App {
     }
 
     /// «Вывод на экран»: частота, поворот, размер экрана, диагностика.
-    fn ui_pump_output(&mut self, ui: &mut egui::Ui, diag: &str, time: f64) {
+    fn ui_pump_output(&mut self, ui: &mut egui::Ui, diag: &str, _time: f64) {
         self.s.cooler_fps = self.s.cooler_fps.clamp(1, 10);
         ui.label(muted_text(format!("Частота: до {} кадр/с", self.s.cooler_fps)));
         ui.add(egui::Slider::new(&mut self.s.cooler_fps, 1..=10).show_value(false));
@@ -2239,7 +2321,7 @@ impl App {
     }
 
     /// Настройки выбранного канала: режим, своя скорость или кривая.
-    fn fan_settings(&mut self, ui: &mut egui::Ui, fan: &Fan, st: &FanState, time: f64, save: &mut bool) {
+    fn fan_settings(&mut self, ui: &mut egui::Ui, fan: &Fan, st: &FanState, _time: f64, save: &mut bool) {
         use fan_curve::{FAN_MIN_PERCENT, FAN_MODE_CURVE, FAN_MODE_FIXED};
         let modes = profiles::FAN_MODE_NAMES;
         let id = fan.id.clone();
@@ -2759,9 +2841,7 @@ impl Drop for App {
     fn drop(&mut self) {
         self.sync_colors();
         let _ = self.s.save();
-        if let Some(s) = self.svc.take() {
-            s.stop();
-        }
+        self.stop_service();
         self.kb.shutdown();
         self.fans.shutdown();
         // Поток вентиляторов отдаёт каналы плате в течение секунды, потом закрываем помощника датчиков.
@@ -2775,13 +2855,18 @@ impl Drop for App {
             None if background => {
                 let _ = service_link::spawn();
             }
-            None => {}
+            // Служба запустилась уже при открытом окне (паузу у неё не брали) и ждёт его закрытия:
+            // без работы в фоне она тоже должна выйти.
+            None => {
+                let _ = service_link::quit();
+            }
         }
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_restart(ctx);
         self.auto_apply(ctx);
         self.tick_extras(ctx);
 
@@ -2971,7 +3056,15 @@ fn main() -> Result<(), eframe::Error> {
         Instance::AlreadyRunning => return Ok(()),
     };
     // Фоновая служба отдаёт устройства окну (ждём, пока отдаст, — иначе они достанутся обоим сразу).
-    let service = service_link::pause();
+    let (service, service_note) = match service_link::pause() {
+        Ok(p) => (p, None),
+        // Служба есть, но устройства не отдала: просим её выйти совсем (ответ «OK» — когда всё остановлено).
+        // При закрытии окна с «работой в фоне» она запустится снова.
+        Err(e) => {
+            let stopped = service_link::quit();
+            (None, (!stopped).then(|| format!("Фоновая служба не отдала устройства ({e}). Закройте её: значок в трее → «Выход», затем откройте окно снова.")))
+        }
+    };
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(WINDOW_TITLE)
         // Меню 236 px + содержимое: меньше этого окно становится тесным, поэтому ниже не даём.
@@ -2990,7 +3083,11 @@ fn main() -> Result<(), eframe::Error> {
             theme::apply(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             single_instance::listen(lock, move || restore(&ctx));
-            Ok(Box::new(App::new(service)))
+            let mut app = App::new(service);
+            if let Some(note) = service_note {
+                app.msg = note;
+            }
+            Ok(Box::new(app))
         }),
     )
 }
